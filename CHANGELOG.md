@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-06-04
+
+### Added
+- Kucoin hedge mode
+
+## [1.5.2] - 2026-06-02
+
+### Added
+- Hyperliquid builder fees
+
+## [1.5.1] - 2026-06-01
+
+### Changed
+- Hyperliquid balance 422 error retry and log
+
 ## [1.5.0] - 2026-05-28
 
 ### Added

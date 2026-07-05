@@ -3,6 +3,7 @@ import {
   AllPricesResponse,
   BaseReturn,
   CandleResponse,
+  FundingRateResponse,
   CommonOrder,
   ExchangeInfo,
   ExchangeIntervals,
@@ -34,6 +35,32 @@ class KrakenError extends Error {
   constructor(message: string, code: string) {
     super(message)
     this.code = code
+  }
+}
+
+/**
+ * Authoritative per-symbol asset class from Kraken Futures' `category` field on
+ * the `/derivatives/api/v3/instruments` response. Kraken's OWN classification —
+ * no name heuristics. Tokenized equities are `xStocks`/`Pre-IPO`; FX perps are
+ * `Forex`; oil etc. is `Commodities`. NOTE: `Real-world assets` and `DTF` are
+ * Kraken's CRYPTO narrative buckets (VET, CFG, LCAP…), so they stay crypto.
+ * Crypto categories (Layer 1/DeFi/Meme/…) and `''` → undefined (main-app
+ * defaults to crypto). Kraken SPOT carries no class signal (every `aclass_base`
+ * is `currency`), so only the futures path is classified.
+ */
+function krakenFuturesAssetClass(
+  category?: string,
+): ExchangeInfo['assetClass'] {
+  switch (category) {
+    case 'xStocks':
+    case 'Pre-IPO':
+      return 'stock'
+    case 'Forex':
+      return 'forex'
+    case 'Commodities':
+      return 'commodity'
+    default:
+      return undefined
   }
 }
 
@@ -849,8 +876,14 @@ class KrakenExchange extends AbstractExchange implements Exchange {
         const orderIds = result.result.txid || []
 
         await sleep(500)
+        // Re-fetch by the original client order id (not the Kraken txid):
+        // getOrder() resolves spot orders by userref = parseInt(clientOrderId
+        // .substring(0,8), 16), the same value set at submit time above. Passing
+        // the txid here yields parseInt('OQCLML-...',16) = NaN, so a resting
+        // limit order is never matched and the deal is wrongly closed. Mirrors
+        // the futures branch, which passes the original cliOrdId.
         return await this.getOrder(
-          { symbol, newClientOrderId: orderIds?.[0] || '' },
+          { symbol, newClientOrderId: newClientOrderId || orderIds?.[0] || '' },
           timeProfile,
         )
       })
@@ -1589,6 +1622,11 @@ class KrakenExchange extends AbstractExchange implements Exchange {
                 wsCode: `${instrument.base}/${instrument.quote}`,
                 code: instrument.symbol,
                 pair: `${instrument.base}-${instrument.quote}`,
+                // Authoritative class from Kraken Futures `category` (undefined
+                // => main-app defaults to crypto). No heuristics.
+                assetClass: krakenFuturesAssetClass(
+                  (instrument as unknown as { category?: string }).category,
+                ),
                 baseAsset: {
                   name: instrument.base || '',
                   minAmount: basePrecision,
@@ -1923,15 +1961,7 @@ class KrakenExchange extends AbstractExchange implements Exchange {
       .getCandles({
         pair: await this.toKrakenSymbol(symbol),
         interval: intervalMinutes as
-          | 1
-          | 5
-          | 15
-          | 30
-          | 60
-          | 240
-          | 1440
-          | 10080
-          | 21600,
+          1 | 5 | 15 | 30 | 60 | 240 | 1440 | 10080 | 21600,
         since: from ? Math.floor(from / 1000) : undefined,
       })
       .then((result) => {
@@ -1975,6 +2005,60 @@ class KrakenExchange extends AbstractExchange implements Exchange {
       .catch(
         this.handleKrakenErrors(
           this.getCandles,
+          this.endProfilerTime(timeProfile, 'exchange'),
+        ),
+      )
+  }
+
+  async getFundingRateHistory(
+    symbol: string,
+    from?: number,
+    to?: number,
+    limit?: number,
+    timeProfile = this.getEmptyTimeProfile(),
+  ): Promise<BaseReturn<FundingRateResponse[]>> {
+    if (!this.usdm || !this.derivativesClient) {
+      // Kraken funding rates exist only for futures (derivatives).
+      return this.usdm
+        ? this.errorClient(timeProfile)
+        : this.returnGood<FundingRateResponse[]>(timeProfile)([])
+    }
+    // Caller passes the Kraken futures code (e.g. PF_XBTUSD) directly.
+    timeProfile =
+      (await this.checkLimits('getFundingRateHistory', symbol, timeProfile)) ||
+      timeProfile
+    timeProfile = this.startProfilerTime(timeProfile, 'exchange')
+    // Kraken returns the full history (no time filter), ascending by timestamp.
+    return this.derivativesClient
+      .getHistoricalFundingRates({ symbol })
+      .then((result) => {
+        timeProfile = this.endProfilerTime(timeProfile, 'exchange')
+        if (!result.rates) {
+          throw new Error('Failed to get funding rates')
+        }
+        return this.returnGood<FundingRateResponse[]>(timeProfile)(
+          result.rates
+            .map((r) => ({
+              symbol,
+              // relativeFundingRate is the fractional rate (vs absolute fundingRate)
+              fundingRate: r.relativeFundingRate,
+              fundingTime: new Date(r.timestamp).getTime(),
+            }))
+            .filter(
+              (r) =>
+                (from ? r.fundingTime >= +from : true) &&
+                (to ? r.fundingTime <= +to : true),
+            )
+            .slice(-(limit ?? Infinity)),
+        )
+      })
+      .catch(
+        this.handleKrakenErrors(
+          this.getFundingRateHistory,
+          symbol,
+          from,
+          to,
+          limit,
           this.endProfilerTime(timeProfile, 'exchange'),
         ),
       )
@@ -2220,16 +2304,21 @@ class KrakenExchange extends AbstractExchange implements Exchange {
     _symbol?: string,
     timeProfile = this.getEmptyTimeProfile(),
   ): Promise<BaseReturn<boolean>> {
-    // Kraken Futures supports hedge mode by default
-    return this.returnGood<boolean>(timeProfile)(true)
+    // Kraken Futures uses a one-way / netting position model (a single net
+    // position per contract; orders carry no positionSide). It does not
+    // support hedge mode, so always report one-way. Reporting `true` here
+    // permanently blocked neutral futures grid bots ("Bot cannot run in
+    // hedge mode").
+    return this.returnGood<boolean>(timeProfile)(false)
   }
 
   async futures_setHedge(
-    value: boolean,
+    _value: boolean,
     timeProfile = this.getEmptyTimeProfile(),
   ): Promise<BaseReturn<boolean>> {
-    // Kraken Futures hedge mode is always enabled
-    return this.returnGood<boolean>(timeProfile)(value)
+    // Hedge mode cannot be enabled on Kraken Futures (one-way / netting only),
+    // so the account stays in one-way mode regardless of the requested value.
+    return this.returnGood<boolean>(timeProfile)(false)
   }
 
   async futures_leverageBracket(

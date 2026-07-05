@@ -7,6 +7,108 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.14.1] - 2026-07-05
+
+### Fixed
+
+- Hyperliquid futures balance under-reported total equity. `futures_getBalance` derived `locked` from `marginSummary.totalMarginUsed` (open-position margin only), so `free + locked = withdrawable + positionMargin` omitted the collateral HL reserves for OPEN ORDERS — a leveraged account with deep resting grid/DCA ladders showed far less than its real `accountValue` (e.g. $13.9k for a $20.8k account). Derive `locked = accountValue - free` (free = `min(withdrawable, accountValue)`) so total equals `accountValue`; still clamps `locked >= 0` and collapses the anomalous non-primary `accountValue=0` dex-state to zero (no phantom balance).
+
+## [1.14.0] - 2026-07-04
+
+### Added
+
+- Hyperliquid spot: emit `isCanonical` per pair (HL-canonical or Unit-bridged = true; permissionless HIP-1 = false) for the dashboard "Canonical only" pair-picker filter.
+
+### Changed
+
+- Hyperliquid spot: stop hiding permissionless TradFi-namesquat tokens; surface every pair and let the dashboard filter/classify them. Equity/RWA spot tokens are still classified via `perpCategories`.
+
+## [1.13.4] - 2026-07-04
+
+### Fixed
+- Hyperliquid `spot_getBalance` now clamps a negative spot `hold` to `0`. Hyperliquid can return a negative `hold` on spot-perp / builder-dex wallets (observed live: USDC `total=59953 hold=-85125`, USDT0 `total=0 hold=-89572`); the old `free = total - hold` inflated `free` by the absolute hold (USDC showed `145078` instead of the real `59953`, USDT a phantom `89572`) and `locked = hold` went negative. Now `locked = max(0, hold)` and `free = max(0, total - locked)`, so `free + locked === total` and neither value is phantom. This is the true source of the wrong Hyperliquid free/locked seen in the dashboard; the earlier `futures_getBalance` and main-app `normalizeLocked` fixes addressed the negative-`locked` symptom but not the inflated spot `free`.
+
+## [1.13.3] - 2026-07-04
+
+### Fixed
+- Hyperliquid `futures_getBalance` now also bounds `free` by the dex-state's own value — `min(withdrawable, accountValue - locked)` — instead of the raw account-level `withdrawable`. Prevents a phantom balance (e.g. USDT `free=89568` on a state whose `accountValue=0`) from surfacing the account total under a non-primary collateral asset. No change for healthy single-collateral accounts where `withdrawable ≤ accountValue - marginUsed`.
+
+## [1.13.2] - 2026-07-04
+
+### Fixed
+- Hyperliquid `futures_getBalance` now derives `locked` from `marginSummary.totalMarginUsed` (per-collateral, always ≥ 0) instead of `accountValue - withdrawable`, which produced a negative `locked` whenever an account-level `withdrawable` exceeded a given dex-state's `accountValue` (e.g. a non-primary collateral reading `accountValue=0`). Fixes negative locked balances propagating to the `balances` collection and wrong "available" display.
+
+## [1.13.1] - 2026-07-04
+
+### Fixed
+- Binance.US API-key verification now hits the spot `GET /api/v3/account` (`getAccountInformation`) instead of the Binance.com-only `GET /sapi/v1/account/info` (`getAccountInfo`), which 404s on Binance.US. Every Binance.US key was being rejected as invalid regardless of its actual validity/permissions.
+
+## [1.13.0] - 2026-07-04
+
+### Changed
+
+- Hyperliquid: all Unit-bridged spot bases now normalize to their canonical ticker (`UETH→ETH`, `USOL→SOL`, … — previously only `UBTC→BTC`), derived authoritatively from `spotMeta` `fullName` with a collision guard (`UPUMP`/`UMOG`/`UUUSPX` stay raw). Both the display pair and the wallet balance asset are normalized, and the raw Unit pair is dual-registered so bots created before the change still resolve.
+
+### Fixed
+
+- Hyperliquid: spot balances now reconcile to the pair base (`UBTC` wallet asset → `BTC`), so SELL side and bot funds no longer read 0 for spot holdings (forum #4860), for every Unit token — not just BTC.
+
+### Removed
+
+- Hyperliquid: un-curated HIP-1 permissionless spot tokens that namesquat a TradFi ticker (`AAPL`, `TSLA`, `MSFT`, … — one-genesis-address synthetics with near-zero depth) are now hidden from the spot listing. The real, curated equity exposure is the HIP-3 perp, classified on the perp path.
+
+## [1.12.0] - 2026-07-04
+
+### Added
+- OKX Europe (`okxsource=my` → eea.okx.com) authoritative spot instruments. New `GET /exchange/account` endpoint + `OKXExchange.getAccountSpotExchangeInfo()` hit the authenticated, account-scoped `/api/v5/account/instruments` and return the account's real tradeable universe (USDC/EUR spot) — the public feed still advertises the global USDT set EU accounts cannot trade. The instrument→`ExchangeInfo` mapper is now shared between the public and account-scoped paths. Non-OKX exchanges resolve to a "not supported" default.
+
+## [1.11.1] - 2026-07-04
+
+### Fixed
+- Binance/Binance.US API-key verification now reports the exchange's real rejection (`code` + message from the client's `.body`/`.response.data`) instead of the useless `Binance us catch [object Object]`. Add-exchange failures for Binance.US were unreadable in the logs, hiding whether the cause was the key, permissions, or IP.
+
+## [1.11.0] - 2026-07-02
+
+### Added
+- Authoritative `assetClass` for **Binance** USDⓈ-M TradFi-Perps, read from the exchange's own `underlyingType` in `getAllExchangeInfo`: `EQUITY`/`KR_EQUITY`/`PREMARKET` → `stock` (an `ETF` subtype → `etf`), `COMMODITY` → `commodity`. `COIN` and Binance's crypto composite `INDEX` (BTCDOM/DEFI/ALL) stay crypto, so existing pairs are untouched. Lets stock/commodity symbols surface under their own asset class downstream.
+
+## [1.10.0] - 2026-07-01
+
+### Added
+- Authoritative `assetClass` for **Hyperliquid** HIP-3 builder-dex (TradFi) perps from its own `perpCategories` info endpoint: `stocks`/`preipo` → `stock`, `commodities` → `commodity`, `indices` → `index`, `fx` → `forex`. Crypto/native perps stay crypto. (Supersedes the 1.9.0 note that Hyperliquid exposes no signal — the signal lives in the separate `perpCategories` endpoint, keyed by `dex:ASSET`.)
+
+### Changed
+- Bitget **SPOT** tokenized stocks (reality tokens `rTSLA`/`rAAPL`/…, v3 `symbolType: stock`) are now **excluded** from spot exchange-info — they are not tradeable through Bitget's API yet, so surfacing them as tradeable pairs was misleading. Re-enable by removing the filter in `spot_getAllExchangeInfo` once Bitget supports API trading for reality stocks. Metals (PAXG/XAUT) are unaffected.
+
+## [1.9.0] - 2026-06-30
+
+### Added
+- Authoritative `assetClass` extended to **Bybit** and **Kraken** (same no-heuristics rule as Bitget):
+  - Bybit reads its own `symbolType` from v5 instruments-info — spot tokenized equities (`xstocks`) → `stock`; linear perps `stock` → `stock` and `commodity` → `commodity` (Bybit's own label for oil/XAU/XAG, kept verbatim).
+  - Kraken Futures reads its own `category` from `/derivatives/api/v3/instruments` — `xStocks`/`Pre-IPO` → `stock`, `Forex` → `forex`, `Commodities` → `commodity`. Kraken's crypto buckets (`Real-world assets`, `DTF`, Layer 1/DeFi/…) stay crypto; Kraken **spot** exposes no class signal (`aclass_base` is uniformly `currency`) so it stays crypto.
+- Investigated and left crypto (no authoritative TradFi field exposed): OKX (`instCategory` is a fee tier; `pre_market` is crypto), Binance, KuCoin, Coinbase, Hyperliquid.
+
+## [1.8.0] - 2026-06-30
+
+### Added
+- Authoritative asset class per symbol on `ExchangeInfo` (`assetClass`: crypto/stock/etf/commodity/metal/forex/index). Bitget populates it from the unified v3 instruments endpoint (`symbolType`) for both spot and futures — no heuristics. Other exchanges leave it unset (default crypto downstream).
+
+## [1.7.2] - 2026-06-28
+
+### Fixed
+- Kraken Futures hedge mode now reports one-way/netting (`getHedge` → false) instead of a hardcoded `true`, which had permanently blocked neutral futures grid bots with "Bot cannot run in hedge mode"
+- Kraken spot `submitOrder` re-resolves the just-placed order by its client order id instead of the Kraken txid, so a resting limit order placed below market is no longer wrongly closed with "Order not found in open orders"
+
+## [1.7.1] - 2026-06-25
+
+### Fixed
+- Binance spot rebate now queries the apiReferral endpoint (`sapi/v1/apiReferral/rebate/recentRecord`) instead of the sub-account broker endpoint, so records carry orderId/email and can be attributed to users
+
+## [1.7.0] - 2026-06-22
+
+### Added
+- Get funding rate hsitory
+
 ## [1.6.1] - 2026-06-08
 
 ### Fixed

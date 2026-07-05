@@ -3,6 +3,7 @@ import {
   AllPricesResponse,
   BaseReturn,
   CandleResponse,
+  FundingRateResponse,
   CommonOrder,
   ExchangeInfo,
   ExchangeIntervals,
@@ -181,17 +182,78 @@ export class HyperliquidError extends Error {
 type Market = 'spot' | 'futures'
 
 /**
- * Hyperliquid spot tokens use deployer-chosen names that differ from how
- * the UI renders them. Aliases here map the on-chain token name to the
- * display name we expose to the rest of the system.
- *   UBTC  → BTC   (wrapped BTC token, shown as BTC)
- *   USDT0 → USDT  (wrapped USDT token, shown as USDT — used by `cash` dex)
+ * Hyperliquid spot tokens use deployer-chosen names that differ from the
+ * canonical ticker the rest of the platform (and the user) thinks in.
+ *
+ * The dominant case is **Unit** (hyperunit.xyz): it bridges spot assets under
+ * a `U`-prefixed name whose `fullName` is `Unit <Asset>` — `UBTC`/'Unit
+ * Bitcoin', `UETH`/'Unit Ethereum', `USOL`/'Unit Solana', and any future one.
+ * We display those under the stripped canonical ticker (`UBTC`→`BTC`).
+ *
+ * This is derived **authoritatively from Hyperliquid's own `spotMeta`**, not a
+ * hand-maintained list: a token is normalized iff its `fullName` starts with
+ * `'Unit '` AND its `name` starts with `'U'`. We strip exactly the leading
+ * `U`. We never blanket-strip `U` (that would mangle real tickers `UP`, `UNI`,
+ * `USDC`, `USDE`, whose `fullName` is not `Unit …`). New Unit assets normalize
+ * automatically with zero code changes. See `buildTokenDisplayMap`.
+ *
+ * Guards: the stripped name must be a safe ident and must NOT collide with an
+ * already-listed token of the same canonical name (`UPUMP`→`PUMP` collides
+ * with the separately-listed `PUMP`) — collisions stay un-normalized so two
+ * markets never share one pair string. `USDT0` (a wrapped-USDT quote whose
+ * `fullName` is `USDT0`, not `Unit …`) keeps a small explicit alias to `USDT`.
+ *
+ * The map is rebuilt from `tokens` on every spot/futures `updateAssets`
+ * refresh. It is seeded with the historically-hardcoded pair so behavior can
+ * never regress below the old static table before the first fetch lands.
  */
-const TOKEN_ALIASES: Record<string, string> = {
-  UBTC: 'BTC',
-  USDT0: 'USDT',
+const SAFE_TOKEN_IDENT = /^[A-Za-z0-9_.]{1,32}$/
+/** Wrapped-stablecoin quotes that are not Unit tokens but should still show
+ *  under their canonical ticker. Kept tiny and explicit. */
+const QUOTE_TOKEN_ALIASES: Record<string, string> = { USDT0: 'USDT' }
+
+function buildTokenDisplayMap(
+  tokens: ReadonlyArray<{ name: string; fullName?: string | null }>,
+): Map<string, string> {
+  const rawNames = new Set(tokens.map((t) => t.name))
+  // Pass 1: propose a canonical display name for every Unit-bridged token.
+  const proposals: Array<[string, string]> = []
+  const proposedCount = new Map<string, number>()
+  for (const t of tokens) {
+    if (
+      (t.fullName ?? '').startsWith('Unit ') &&
+      t.name.startsWith('U') &&
+      t.name.length > 1
+    ) {
+      const stripped = t.name.slice(1)
+      if (SAFE_TOKEN_IDENT.test(stripped) && !stripped.includes('..')) {
+        proposals.push([t.name, stripped])
+        proposedCount.set(stripped, (proposedCount.get(stripped) ?? 0) + 1)
+      }
+    }
+  }
+  const map = new Map<string, string>()
+  // Pass 2: accept a proposal only when its canonical name doesn't collide
+  // with an already-listed raw token OR with another Unit proposal.
+  for (const [name, display] of proposals) {
+    if (rawNames.has(display)) continue
+    if ((proposedCount.get(display) ?? 0) > 1) continue
+    map.set(name, display)
+  }
+  // Explicit wrapped-stablecoin quote aliases, collision-guarded the same way.
+  for (const [from, to] of Object.entries(QUOTE_TOKEN_ALIASES)) {
+    if (!rawNames.has(to) && !map.has(from)) map.set(from, to)
+  }
+  return map
 }
-const aliasToken = (name: string): string => TOKEN_ALIASES[name] ?? name
+
+/** Rebuilt on every spotMeta fetch (`updateAssets`). Seeded with the old
+ *  static pair so a failed/late first fetch can't regress UBTC/USDT0. */
+let tokenDisplayMap: Map<string, string> = new Map([
+  ['UBTC', 'BTC'],
+  ['USDT0', 'USDT'],
+])
+const aliasToken = (name: string): string => tokenDisplayMap.get(name) ?? name
 
 /**
  * Hyperliquid HIP-3 builder dexes let third-party deployers register
@@ -225,6 +287,35 @@ export type FuturesAssetInfo = {
   maxLeverage: number
   isDelisted: boolean
   marginTableId: number
+  /** Authoritative asset class from Hyperliquid `perpCategories` (builder-dex
+   *  TradFi perps: stocks/commodities/indices/fx/preipo). Undefined => crypto. */
+  assetClass?: ExchangeInfo['assetClass']
+}
+
+/**
+ * Map Hyperliquid's own `perpCategories` value to our normalized asset class.
+ * This is Hyperliquid's authoritative classification of builder-dex (HIP-3)
+ * TradFi perps — NOT a name heuristic. Hyperliquid lumps precious metals under
+ * `commodities` (GOLD/SILVER/PLATINUM), which we keep verbatim (re-bucketing to
+ * `metal` by ticker name would be a forbidden heuristic). `fx`/`FX` case varies
+ * across dexes. `crypto` and anything unknown => undefined (defaults to crypto).
+ */
+const hyperliquidPerpCategoryToClass = (
+  category?: string,
+): ExchangeInfo['assetClass'] => {
+  switch ((category ?? '').toLowerCase()) {
+    case 'stocks':
+    case 'preipo':
+      return 'stock'
+    case 'commodities':
+      return 'commodity'
+    case 'indices':
+      return 'index'
+    case 'fx':
+      return 'forex'
+    default:
+      return undefined
+  }
 }
 
 type RawPerpDex = {
@@ -267,6 +358,12 @@ class HyperliquidAssets {
   private futuresByCode: Map<string, string> = new Map()
   /** Builder-dex names with at least one listed market (HL native excluded). */
   private dexNames: Set<string> = new Set()
+  /** Canonical ticker → assetClass, derived from Hyperliquid's authoritative
+   *  `perpCategories` (perps-only endpoint). Used to classify SPOT RWA/equity
+   *  pairs (AAPL/TSLA/… tokenized stocks) that HL lists on spot but does not
+   *  classify there — we cross-reference the perp classification by ticker. */
+  private assetClassByBase: Map<string, ExchangeInfo['assetClass']> = new Map()
+  private lastAssetClassFetch = 0
   private lastUpdateSpot = 0
   private lastUpdateFutures = 0
   private updateInterval = 20 * 60000
@@ -289,6 +386,79 @@ class HyperliquidAssets {
       await this.updateAssets('spot')
     }
     return `${10000 + (this.assetsSpot.get(pair) ?? 0)}`
+  }
+
+  /** Ensure the spot token display map (`tokenDisplayMap`) is populated.
+   *  Used by spot balance normalization, which reads clearinghouse state and
+   *  never fetches spot meta itself, so it would otherwise see an unwarmed
+   *  (seed-only) map right after boot. */
+  public async ensureSpotAssets(): Promise<void> {
+    if (
+      this.assetsSpot.size === 0 ||
+      this.lastUpdateSpot + this.updateInterval < Date.now()
+    ) {
+      await this.updateAssets('spot')
+    }
+  }
+
+  /** Refresh the ticker→assetClass map from `perpCategories` (Hyperliquid's
+   *  authoritative classifier). Cheap single call, cached like the other maps;
+   *  the previous map is preserved on failure so spot classification degrades
+   *  to "last known" rather than empty. */
+  public async ensureAssetClasses(): Promise<void> {
+    if (
+      this.assetClassByBase.size > 0 &&
+      this.lastAssetClassFetch + this.updateInterval > Date.now()
+    ) {
+      return
+    }
+    // perpCategories is a mainnet classifier; skip on demo.
+    if (process.env.HYPERLIQUIDENV === 'demo') return
+    try {
+      await this.checkLimits('perpCategories', 20)
+      const cats = (await this.client.transport.request('info', {
+        type: 'perpCategories',
+      })) as [string, string][]
+      if (Array.isArray(cats) && cats.length > 0) {
+        const m = new Map<string, ExchangeInfo['assetClass']>()
+        for (const [code, cat] of cats) {
+          // Strip any builder-dex prefix ('xyz:AAPL' → 'AAPL').
+          const base = code.includes(':')
+            ? code.slice(code.indexOf(':') + 1)
+            : code
+          const cls = hyperliquidPerpCategoryToClass(cat)
+          if (cls) m.set(base, cls)
+        }
+        this.assetClassByBase = m
+        this.lastAssetClassFetch = Date.now()
+      }
+    } catch (e) {
+      Logger.warn(
+        `Hyperliquid perpCategories (spot classify) failed: ${(e as Error)?.message ?? e}`,
+      )
+    }
+  }
+
+  /** Asset class for a SPOT pair whose base is `baseTicker` (canonical /
+   *  normalized). Returns a TradFi class ONLY for an un-curated HIP-1 spot
+   *  token that namesquats a real ticker — a permissionless deployment we
+   *  should HIDE from the listing (near-zero depth, one-genesis-address
+   *  synthetic; the real equity exposure is the HIP-3 perp, which HL curates
+   *  and which we classify on the perp path). Undefined = keep (legit).
+   *
+   *  Signal (spotMeta-only, no per-token calls): the base ticker matches a
+   *  TradFi-classified perp (`perpCategories`) AND the token is NOT a curated
+   *  Unit issuance. Unit-bridged assets — crypto ('Unit Bitcoin') and Unit
+   *  xStocks ('Unit SP500 xStock') alike — start their `fullName` with
+   *  'Unit ' and are kept; the namesquats (fullName null or '… - Wagyu.xyz')
+   *  are hidden. This also protects real Unit crypto from a coincidental
+   *  ticker collision with a TradFi perp. */
+  public spotNamesquatClass(
+    baseTicker: string,
+    fullName?: string | null,
+  ): ExchangeInfo['assetClass'] {
+    if ((fullName ?? '').startsWith('Unit ')) return undefined
+    return this.assetClassByBase.get(baseTicker)
   }
 
   @IdMute(mutex, () => 'getCoinNameByPair')
@@ -407,14 +577,20 @@ class HyperliquidAssets {
       try {
         await this.checkLimits('spotMeta', 20)
         const { tokens, universe } = await this.client.spotMeta()
+        tokenDisplayMap = buildTokenDisplayMap(tokens)
         universe.forEach((u) => {
           const base = tokens.find((tk) => tk.index === u.tokens[0])
           const quote = tokens.find((tk) => tk.index === u.tokens[1])
           if (base && quote) {
-            base.name = aliasToken(base.name)
-            const pair = `${base.name}-${aliasToken(quote.name)}`
-            this.assetsSpot.set(pair, u.index)
-            this.pairsSpot.set(u.index, pair)
+            // Normalized display pair (what we emit everywhere) plus the raw
+            // Unit pair registered as a backward-compat alias, so bots created
+            // before normalization (stored e.g. 'UETH-USDC') still resolve to
+            // the same market. Reverse lookup returns the normalized form.
+            const dispPair = `${aliasToken(base.name)}-${aliasToken(quote.name)}`
+            const rawPair = `${base.name}-${quote.name}`
+            this.assetsSpot.set(dispPair, u.index)
+            if (rawPair !== dispPair) this.assetsSpot.set(rawPair, u.index)
+            this.pairsSpot.set(u.index, dispPair)
           }
         })
       } catch (e) {
@@ -444,6 +620,9 @@ class HyperliquidAssets {
     try {
       await this.checkLimits('spotMeta', 20)
       const spotTokens = (await this.client.spotMeta()).tokens
+      // Keep the display map fresh even when only a futures refresh runs
+      // (same spotMeta tokens → identical map as the spot branch).
+      tokenDisplayMap = buildTokenDisplayMap(spotTokens)
       // Hyperliquid testnet has thousands of builder dexes (most empty),
       // so enumerating them all on demo wastes the rate-limit budget and
       // never finishes. Skip the perpDexs() fan-out and only fetch HL
@@ -543,6 +722,33 @@ class HyperliquidAssets {
         } catch (e) {
           Logger.error(
             `Hyperliquid meta failed for ${dex?.name ?? 'native'}: ${(e as Error)?.message ?? e}`,
+          )
+        }
+      }
+      // Authoritative asset class for builder-dex (HIP-3) TradFi perps.
+      // `perpCategories` maps each wire code (`dex:ASSET`, e.g. `xyz:AAPL`) to
+      // Hyperliquid's own category (stocks/commodities/indices/fx/preipo/crypto).
+      // One call returns every dex. Not exposed by the SDK, so we go through the
+      // transport directly (respects the connector's outbound IP binding). On
+      // any failure we leave classes unset → everything defaults to crypto.
+      if (!isDemo) {
+        try {
+          await this.checkLimits('perpDexs', 20)
+          const cats = (await this.client.transport.request('info', {
+            type: 'perpCategories',
+          })) as [string, string][]
+          if (Array.isArray(cats)) {
+            const catByCode = new Map(cats)
+            for (const info of newByPair.values()) {
+              const cls = hyperliquidPerpCategoryToClass(
+                catByCode.get(info.code),
+              )
+              if (cls) info.assetClass = cls
+            }
+          }
+        } catch (e) {
+          Logger.warn(
+            `Hyperliquid perpCategories failed: ${(e as Error)?.message ?? e}`,
           )
         }
       }
@@ -854,8 +1060,31 @@ class HyperliquidExchange extends AbstractExchange implements Exchange {
       const totals = new Map<string, { free: number; locked: number }>()
       for (const { asset, state } of states) {
         if (!state) continue
-        const free = +state.withdrawable
-        const locked = +state.marginSummary.accountValue - free
+        // Total balance for a futures collateral MUST equal its equity
+        // (`marginSummary.accountValue`), i.e. free + locked = accountValue.
+        // `free` = the portion available to withdraw / open new orders =
+        // `withdrawable`; `locked` = everything else tied up as margin. Crucially
+        // `locked` is NOT `totalMarginUsed` — that counts only OPEN-POSITION
+        // margin and omits the collateral HL reserves for OPEN ORDERS, so
+        // `withdrawable + totalMarginUsed` under-reports the account by the
+        // open-order margin (e.g. a grid bot with deep resting ladders shows far
+        // less than its real equity). Derive `locked = accountValue - free`
+        // instead — it captures position margin + open-order margin + any other
+        // reserved collateral, and equals the old `accountValue - withdrawable`.
+        //
+        // `free` is bounded by THIS dex-state's own accountValue, not the raw
+        // (account-level) `withdrawable`: for a healthy single-collateral account
+        // withdrawable <= accountValue so this is `withdrawable` (no change); for
+        // the anomalous non-primary state reading accountValue=0 while
+        // withdrawable carries the account total it collapses to free=0/locked=0,
+        // dropping the phantom balance instead of surfacing it under the wrong
+        // asset. Both clamped >= 0, so `locked` can never go negative.
+        const accountValue = +state.marginSummary.accountValue || 0
+        const free = Math.max(
+          0,
+          Math.min(+state.withdrawable || 0, accountValue),
+        )
+        const locked = Math.max(0, accountValue - free)
         const cur = totals.get(asset) ?? { free: 0, locked: 0 }
         cur.free += free
         cur.locked += locked
@@ -1051,7 +1280,7 @@ class HyperliquidExchange extends AbstractExchange implements Exchange {
     retryCount = 0,
   ): Promise<BaseReturn<CommonOrder>> {
     timeProfile =
-      (await this.checkLimits('getOrderStatus', 1, timeProfile)) || timeProfile
+      (await this.checkLimits('getOrderStatus', 2, timeProfile)) || timeProfile
     timeProfile = this.startProfilerTime(timeProfile, 'exchange')
     if (timeProfile.inQueueStartTime && timeProfile.inQueueEndTime) {
       const diff = timeProfile.inQueueEndTime - timeProfile.inQueueStartTime
@@ -1097,7 +1326,7 @@ class HyperliquidExchange extends AbstractExchange implements Exchange {
         ) {
           try {
             timeProfile =
-              (await this.checkLimits('userFillsByTime', 1, timeProfile)) ||
+              (await this.checkLimits('userFillsByTime', 20, timeProfile)) ||
               timeProfile
             timeProfile = this.startProfilerTime(timeProfile, 'exchange')
             const fills = await this.infoClient
@@ -1248,7 +1477,7 @@ class HyperliquidExchange extends AbstractExchange implements Exchange {
       timeProfile = this.startProfilerTime(timeProfile, 'exchange')
       for (const dex of targets) {
         timeProfile =
-          (await this.checkLimits('getFuturesOpenOrders', 0, timeProfile)) ||
+          (await this.checkLimits('getFuturesOpenOrders', 20, timeProfile)) ||
           timeProfile
         if (timeProfile.inQueueStartTime && timeProfile.inQueueEndTime) {
           const diff = timeProfile.inQueueEndTime - timeProfile.inQueueStartTime
@@ -1873,6 +2102,9 @@ class HyperliquidExchange extends AbstractExchange implements Exchange {
           res.push({
             code: a.code,
             pair: a.pair,
+            // Authoritative class from Hyperliquid perpCategories (undefined =>
+            // main-app defaults to crypto). No heuristics.
+            assetClass: a.assetClass,
             baseAsset: {
               minAmount,
               maxAmount: 0,
@@ -1933,53 +2165,81 @@ class HyperliquidExchange extends AbstractExchange implements Exchange {
 
         const pairs = result.universe
         const tokens = result.tokens
+        // Refresh the display map from the tokens we just fetched (raw names),
+        // so the pair listing normalizes consistently even if this runs before
+        // an updateAssets() refresh.
+        tokenDisplayMap = buildTokenDisplayMap(tokens)
+        // Warm the ticker→assetClass map so spot RWA/equity pairs (AAPL, TSLA,
+        // …) get classified as stocks. Hyperliquid only classifies TradFi on
+        // the perp side (perpCategories); we cross-reference it onto spot by
+        // ticker. See spotAssetClass().
+        await HyperliquidAssets.getInstance().ensureAssetClasses()
 
         return this.returnGood<
           (ExchangeInfo & {
             pair: string
           })[]
         >(timeProfile)(
-          pairs.map((d) => {
-            const base = tokens.find((t) => t.index === d.tokens[0])
-            const quote = tokens.find((t) => t.index === d.tokens[1])
-            if (!base || !quote) {
-              return null
-            }
+          pairs
+            .map((d, i) => {
+              const base = tokens.find((t) => t.index === d.tokens[0])
+              const quote = tokens.find((t) => t.index === d.tokens[1])
+              if (!base || !quote) {
+                return null
+              }
 
-            base.name = aliasToken(base.name)
-            quote.name = aliasToken(quote.name)
-            const minAmountBase =
-              base.szDecimals === 0
-                ? 1
-                : +`0.${'0'.repeat(base.szDecimals - 1)}1`
+              // isCanonical is read off the RAW token before we alias its name.
+              const canonical =
+                !!base.isCanonical || (base.fullName ?? '').startsWith('Unit ')
+              base.name = aliasToken(base.name)
+              quote.name = aliasToken(quote.name)
+              // Previously we HID un-curated HIP-1 spot tokens that namesquat a
+              // TradFi ticker (AAPL/TSLA/…). Instead we surface every pair and let
+              // the dashboard filter/annotate them: `isCanonical` drives the
+              // pair-picker "Canonical only" toggle (HL-canonical or Unit-bridged
+              // = canonical; permissionless HIP-1 = non-canonical). We still reuse
+              // the perpCategories cross-reference (Unit-guarded) to classify
+              // equity/commodity spot tokens so they land under the right tab.
+              const assetClass =
+                HyperliquidAssets.getInstance().spotNamesquatClass(
+                  base.name,
+                  base.fullName,
+                )
+              const minAmountBase =
+                base.szDecimals === 0
+                  ? 1
+                  : +`0.${'0'.repeat(base.szDecimals - 1)}1`
 
-            const pricePrecision = this.calculatePricePrecision(
-              'spot',
-              base.szDecimals,
-              `${base.name}-${quote.name}`,
-              allPrices.data,
-            )
+              const pricePrecision = this.calculatePricePrecision(
+                'spot',
+                base.szDecimals,
+                `${base.name}-${quote.name}`,
+                allPrices.data,
+              )
 
-            const res = {
-              code: d.name,
-              pair: `${base.name}-${quote.name}`,
-              baseAsset: {
-                minAmount: minAmountBase,
-                maxAmount: 0,
-                step: minAmountBase,
-                name: base.name,
-                maxMarketAmount: 0,
-              },
-              quoteAsset: {
-                minAmount: 10,
-                name: quote.name,
-                precision: quote.szDecimals,
-              },
-              maxOrders: 200,
-              priceAssetPrecision: pricePrecision,
-            }
-            return res
-          }),
+              const res = {
+                code: d.name,
+                pair: `${base.name}-${quote.name}`,
+                assetClass,
+                isCanonical: canonical,
+                baseAsset: {
+                  minAmount: minAmountBase,
+                  maxAmount: 0,
+                  step: minAmountBase,
+                  name: base.name,
+                  maxMarketAmount: 0,
+                },
+                quoteAsset: {
+                  minAmount: 10,
+                  name: quote.name,
+                  precision: quote.szDecimals,
+                },
+                maxOrders: 200,
+                priceAssetPrecision: pricePrecision,
+              }
+              return res
+            })
+            .filter((r) => r !== null),
         )
       })
       .catch(
@@ -2024,19 +2284,38 @@ class HyperliquidExchange extends AbstractExchange implements Exchange {
           return this.returnBad(timeProfile)(new Error('Response timeout'))
         }
       }
+      // Warm the token display map so wrapped wallet assets normalize to the
+      // same ticker the pair base uses (UBTC->BTC, UETH->ETH, …). Without
+      // this, balance.asset ('UBTC') never matches the aliased pair base
+      // ('BTC') and consumers that reconcile by string-equality read 0 — the
+      // user can't sell their spot balance and bot forms show no funds
+      // (forum #4860).
+      await HyperliquidAssets.getInstance().ensureSpotAssets()
       const get = await this.infoClient.spotClearinghouseState({
         user: this._key,
       })
       timeProfile = this.endProfilerTime(timeProfile, 'exchange')
 
       const data = get.balances
-      data.map((b) =>
+      data.map((b) => {
+        // Hyperliquid spot `hold` is nominally the amount reserved by open
+        // orders and should be >= 0, but the API can return a NEGATIVE hold on
+        // spot-perp / builder-dex wallets (observed live: USDC total=59953
+        // hold=-85125, USDT0 total=0 hold=-89572). The old
+        // `free = total - hold` then INFLATED free by the absolute hold — the
+        // account showed USDC free=145078 instead of the real 59953 and USDT
+        // free=89572 with nothing actually held — and `locked = hold` went
+        // negative. `total` is the authoritative spot balance, so clamp hold to
+        // >= 0: locked is never negative, free never exceeds the real total,
+        // and free + locked === total for every asset.
+        const locked = Math.max(0, +b.hold || 0)
+        const free = Math.max(0, (+b.total || 0) - locked)
         res.push({
-          asset: b.coin,
-          free: +b.total - +b.hold,
-          locked: +b.hold,
-        }),
-      )
+          asset: aliasToken(b.coin),
+          free,
+          locked,
+        })
+      })
     } catch (e) {
       return this.handleHyperliquidErrors(
         this.futures_getBalance,
@@ -2344,6 +2623,49 @@ class HyperliquidExchange extends AbstractExchange implements Exchange {
 
   getUsage() {
     return limitHelper.getUsage()
+  }
+
+  async getFundingRateHistory(
+    symbol: string,
+    from?: number,
+    to?: number,
+    limit?: number,
+    timeProfile = this.getEmptyTimeProfile(),
+  ): Promise<BaseReturn<FundingRateResponse[]>> {
+    // Hyperliquid requires startTime; default to a 7d lookback when omitted.
+    const endTime = to ? +to : +new Date()
+    const startTime = from ? +from : endTime - 7 * 24 * 60 * 60 * 1000
+    timeProfile =
+      (await this.checkLimits('fundingHistory', 20, timeProfile)) || timeProfile
+    timeProfile = this.startProfilerTime(timeProfile, 'exchange')
+    return this.infoClient
+      .fundingHistory({
+        coin: symbol,
+        startTime,
+        endTime,
+      })
+      .then((result) => {
+        timeProfile = this.endProfilerTime(timeProfile, 'exchange')
+        return this.returnGood<FundingRateResponse[]>(timeProfile)(
+          (result ?? [])
+            .map((r) => ({
+              symbol,
+              fundingRate: parseFloat(r.fundingRate),
+              fundingTime: +r.time,
+            }))
+            .slice(0, limit),
+        )
+      })
+      .catch(
+        this.handleHyperliquidErrors(
+          this.getFundingRateHistory,
+          symbol,
+          from,
+          to,
+          limit,
+          this.endProfilerTime(timeProfile, 'exchange'),
+        ),
+      )
   }
 
   async getTrades(

@@ -1,6 +1,19 @@
+export type AssetClass =
+  | 'crypto'
+  | 'stock'
+  | 'etf'
+  | 'commodity'
+  | 'metal'
+  | 'forex'
+  | 'index'
+
 export type ExchangeInfo = {
   wsCode?: string
   code?: string
+  // Asset class of the instrument. Producers set this where the exchange exposes
+  // an authoritative signal (e.g. Bitget `isRwa`); consumers (main-app) refine /
+  // default it. Absent => treat as 'crypto'. See platform Danger List #1.
+  assetClass?: AssetClass
   baseAsset: {
     minAmount: number
     maxAmount: number
@@ -16,6 +29,12 @@ export type ExchangeInfo = {
   }
   maxOrders: number
   priceAssetPrecision: number
+  // Whether the market is a canonical / officially-curated listing on its
+  // exchange. Currently only Hyperliquid spot sets it (HL `isCanonical` OR a
+  // Unit-bridged asset); everything else leaves it undefined = treated as
+  // canonical. The dashboard's "Canonical only" pair-picker toggle filters on
+  // `=== false` so non-HL exchanges are unaffected.
+  isCanonical?: boolean
   priceMultiplier?: {
     up: number
     down: number
@@ -76,6 +95,20 @@ export type TradeResponse = {
   firstId: number
   lastId: number
   timestamp: number
+}
+
+export type FundingRateResponse = {
+  /** Universal symbol, e.g. BTCUSDT */
+  symbol: string
+  /** Settled funding rate as a fraction, e.g. -0.000123 */
+  fundingRate: number
+  /** Settlement time in milliseconds */
+  fundingTime: number
+  /**
+   * Mark price associated with the funding charge, when the exchange supplies
+   * it (currently Binance USDM). Absent otherwise — the publisher resolves it.
+   */
+  markPrice?: number
 }
 
 export enum ExchangeIntervals {

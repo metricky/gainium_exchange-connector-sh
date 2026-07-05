@@ -80,6 +80,15 @@ export class ExchangeController {
     return this.exchangeService.getAllExchangeInfo(exchange)
   }
 
+  /**
+   * Authenticated, account-scoped SPOT instruments (OKX Europe `okxsource=my`).
+   * Keys + okxsource arrive as headers (AuthData), same as /balance et al.
+   */
+  @Get('/exchange/account')
+  async getAccountSpotExchangeInfo(@Headers() headers: AuthData) {
+    return this.exchangeService.getAccountSpotExchangeInfo(headers)
+  }
+
   @Get('/candles')
   async getCandles(
     @Query('exchange') exchange: ExchangeEnum,
@@ -96,6 +105,23 @@ export class ExchangeController {
       from,
       to,
       count,
+    )
+  }
+
+  @Get('/fundingRateHistory')
+  async getFundingRateHistory(
+    @Query('exchange') exchange: ExchangeEnum,
+    @Query('symbol') symbol: string,
+    @Query('from') from: number = null,
+    @Query('to') to: number = null,
+    @Query('limit') limit: number = null,
+  ) {
+    return this.exchangeService.getFundingRateHistory(
+      exchange,
+      symbol,
+      from,
+      to,
+      limit,
     )
   }
 

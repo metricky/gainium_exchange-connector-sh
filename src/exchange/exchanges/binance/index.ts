@@ -24,6 +24,7 @@ import limitHelper from './limit'
 import {
   BaseReturn,
   CandleResponse,
+  FundingRateResponse,
   CommonOrder,
   ExchangeInfo,
   FreeAsset,
@@ -61,6 +62,35 @@ export enum HttpMethod {
   OPTIONS = 'OPTIONS',
   TRACE = 'TRACE',
   PATCH = 'PATCH',
+}
+
+/**
+ * Map Binance USDⓈ-M futures `underlyingType` to our asset class. Binance's
+ * `/fapi/v1/exchangeInfo` is the authoritative signal for its TradFi-Perps
+ * (RWA) listings:
+ *   - `EQUITY` / `KR_EQUITY` / `PREMARKET` → stock (Pre-IPO like OPENAI/ANTHROPIC
+ *     is a `PREMARKET` equity); an `ETF` `underlyingSubType` refines to `etf`.
+ *   - `COMMODITY` → commodity (gold/silver/oil/natgas, all `TradFi` subtype).
+ *   - `INDEX` is Binance's own CRYPTO composite index (BTCDOM/DEFI/ALL, subtype
+ *     `Index`) and `COIN` is crypto — both left undefined so they default to
+ *     crypto and existing pairs are untouched.
+ * Only USDⓈ-M carries these; COIN-M is inverse crypto. See platform Danger List #1.
+ */
+function binanceFuturesAssetClass(
+  underlyingType?: string,
+  underlyingSubType?: string[],
+): ExchangeInfo['assetClass'] {
+  const sub = underlyingSubType || []
+  switch (underlyingType) {
+    case 'EQUITY':
+    case 'KR_EQUITY':
+    case 'PREMARKET':
+      return sub.includes('ETF') ? 'etf' : 'stock'
+    case 'COMMODITY':
+      return 'commodity'
+    default:
+      return undefined
+  }
 }
 
 class BinanceExchange extends AbstractExchange implements Exchange {
@@ -231,12 +261,16 @@ class BinanceExchange extends AbstractExchange implements Exchange {
     if (!params.endTime) {
       delete params.endTime
     }
+    // Use the apiReferral endpoint (our program is an API referral partner, not
+    // a sub-account broker). It returns per-trade orderId + email, which lets
+    // the consumer attribute rebates to users. The broker sub-account endpoint
+    // (getBrokerSpotCommissionRebate) only returns subaccountId="null" for us.
     return this.client
-      .getBrokerSpotCommissionRebate(params)
-      .then((data) => {
+      .getPrivate('sapi/v1/apiReferral/rebate/recentRecord', params)
+      .then((data: unknown) => {
         timeProfile = this.endProfilerTime(timeProfile, 'exchange')
         return this.returnGood<RebateRecord[]>(timeProfile)(
-          data as unknown as RebateRecord[],
+          data as RebateRecord[],
         )
       })
       .catch(
@@ -401,8 +435,7 @@ class BinanceExchange extends AbstractExchange implements Exchange {
       .then(
         (
           accountInfo:
-            | FuturesAccountInformation
-            | FuturesCoinMAccountInformation,
+            FuturesAccountInformation | FuturesCoinMAccountInformation,
         ) => {
           timeProfile = this.endProfilerTime(timeProfile, 'exchange')
           return this.returnGood<FreeAsset>(timeProfile)(
@@ -1460,6 +1493,17 @@ class BinanceExchange extends AbstractExchange implements Exchange {
                 quoteAsset,
                 baseAsset,
                 maxOrders,
+                // USDⓈ-M is the only Binance market carrying TradFi-Perps (RWA);
+                // COIN-M is inverse crypto. `underlyingType`/`underlyingSubType`
+                // are on the fapi symbol but not on the SDK's typed shape.
+                assetClass: this.usdm
+                  ? binanceFuturesAssetClass(
+                      //@ts-ignore
+                      pair.underlyingType,
+                      //@ts-ignore
+                      pair.underlyingSubType,
+                    )
+                  : undefined,
                 priceAssetPrecision: this.getPricePrecision(
                   `${priceFilter?.tickSize || '0.1'}`,
                 ),
@@ -1525,7 +1569,9 @@ class BinanceExchange extends AbstractExchange implements Exchange {
       (await this.checkLimits(
         'getAllOpenOrders',
         'request',
-        this.isNewLimit ? 80 : 40,
+        // Official Binance spot weight: 6 (new) / 3 (old) with a symbol,
+        // 80 (new) / 40 (old) without. US stays on the old scheme.
+        symbol ? (this.isNewLimit ? 6 : 3) : this.isNewLimit ? 80 : 40,
         timeProfile,
       )) || timeProfile
     const input: { symbol?: string; recvWindow: number } = {
@@ -2067,6 +2113,58 @@ class BinanceExchange extends AbstractExchange implements Exchange {
           from,
           to,
           countData,
+          this.endProfilerTime(timeProfile, 'exchange'),
+        ),
+      )
+  }
+
+  async getFundingRateHistory(
+    symbol: string,
+    from?: number,
+    to?: number,
+    limit?: number,
+    timeProfile = this.getEmptyTimeProfile(),
+  ): Promise<BaseReturn<FundingRateResponse[]>> {
+    const client = this.usdm ? this.usdmClient : this.coinmClient
+    if (!client) {
+      return this.errorClient(timeProfile)
+    }
+    timeProfile =
+      (await this.checkLimits(
+        'getFundingRateHistory',
+        'request',
+        1,
+        timeProfile,
+      )) || timeProfile
+    timeProfile = this.startProfilerTime(timeProfile, 'exchange')
+    return client
+      .getFundingRateHistory({
+        symbol,
+        startTime: from ? +from : undefined,
+        endTime: to ? +to : undefined,
+        limit: limit ?? 1000,
+      })
+      .then((res) => {
+        timeProfile = this.endProfilerTime(timeProfile, 'exchange')
+        return this.returnGood<FundingRateResponse[]>(timeProfile)(
+          (res ?? []).map((r) => ({
+            symbol: r.symbol,
+            fundingRate: parseFloat(`${r.fundingRate}`),
+            fundingTime: +r.fundingTime,
+            markPrice:
+              r.markPrice !== undefined && r.markPrice !== ''
+                ? parseFloat(`${r.markPrice}`)
+                : undefined,
+          })),
+        )
+      })
+      .catch(
+        this.handleBinanceErrors(
+          this.getFundingRateHistory,
+          symbol,
+          from,
+          to,
+          limit,
           this.endProfilerTime(timeProfile, 'exchange'),
         ),
       )

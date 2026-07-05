@@ -3,6 +3,7 @@ import {
   AllPricesResponse,
   BaseReturn,
   CandleResponse,
+  FundingRateResponse,
   CommonOrder,
   ExchangeInfo,
   ExchangeIntervals,
@@ -1298,6 +1299,50 @@ class BitgetExchange extends AbstractExchange implements Exchange {
     return this.spot_getAllExchangeInfo()
   }
 
+  /**
+   * Authoritative per-symbol asset class from Bitget's unified v3 instruments
+   * endpoint (`symbolType` = crypto | stock | metal | commodity). This is the
+   * ONLY Bitget endpoint that classifies real-world assets — the classic
+   * spot/futures `symbolType` is just `perpetual`. Returns a symbol→class map;
+   * on any failure returns an empty map (rows fall back to undefined → crypto).
+   * `category`: SPOT | USDT-FUTURES | COIN-FUTURES | USDC-FUTURES (demo `S`
+   * prefix stripped — v3 only knows the live categories).
+   */
+  private async bitgetAssetClassMap(
+    category: string,
+  ): Promise<Map<string, ExchangeInfo['assetClass']>> {
+    const map = new Map<string, ExchangeInfo['assetClass']>()
+    // Demo futures categories are S-prefixed (SUSDT-FUTURES …); v3 only knows
+    // the live names. Strip the leading S ONLY for those — never for SPOT.
+    const liveCategory = category.replace(
+      /^S(?=(?:USDT|USDC|COIN)-FUTURES$)/,
+      '',
+    )
+    try {
+      const res = await this.orderClient.getInstrumentsV3({
+        category: liveCategory,
+      })
+      if (res?.code === '00000' && Array.isArray(res.data)) {
+        for (const d of res.data) {
+          const st = d?.symbolType
+          if (
+            st === 'crypto' ||
+            st === 'stock' ||
+            st === 'metal' ||
+            st === 'commodity'
+          ) {
+            map.set(d.symbol, st)
+          }
+        }
+      }
+    } catch (e) {
+      Logger.warn(
+        `bitget v3 instruments ${liveCategory} failed: ${(e as Error)?.message}`,
+      )
+    }
+    return map
+  }
+
   async futures_getAllExchangeInfo(
     timeProfile = this.getEmptyTimeProfile(),
   ): Promise<
@@ -1329,6 +1374,9 @@ class BitgetExchange extends AbstractExchange implements Exchange {
           timeProfile
         timeProfile = this.startProfilerTime(timeProfile, 'exchange')
         const get = await this.client.getFuturesContractConfig({ productType })
+        // Authoritative asset class (crypto/stock/metal/commodity) from the v3
+        // instruments endpoint — keyed by symbol for this productType.
+        const assetClassMap = await this.bitgetAssetClassMap(productType)
         timeProfile = this.endProfilerTime(timeProfile, 'exchange')
         if (get.code === '00000') {
           const data = get.data
@@ -1337,6 +1385,9 @@ class BitgetExchange extends AbstractExchange implements Exchange {
             .map((d) => {
               const r: (typeof res)[0] = {
                 pair: d.symbol,
+                // Authoritative class from Bitget v3 (undefined => main-app
+                // defaults to crypto). No heuristics.
+                assetClass: assetClassMap.get(d.symbol),
                 baseAsset: {
                   minAmount: +d.minTradeNum,
                   maxAmount: 0,
@@ -1403,6 +1454,8 @@ class BitgetExchange extends AbstractExchange implements Exchange {
       (await this.checkLimits('getSpotSymbolInfo', 20, timeProfile)) ||
       timeProfile
     const prices = await this.spot_getAllPrices()
+    // Authoritative asset class (crypto/stock/metal/commodity) from Bitget v3.
+    const assetClassMap = await this.bitgetAssetClassMap('SPOT')
     return this.client
       .getSpotSymbolInfo()
       .then(async (result) => {
@@ -1418,6 +1471,13 @@ class BitgetExchange extends AbstractExchange implements Exchange {
           >(timeProfile)(
             data
               .filter((d) => d.status === 'online')
+              // Bitget SPOT tokenized stocks (reality tokens rTSLA/rAAPL/…,
+              // v3 `symbolType: stock`) are NOT tradeable through Bitget's API
+              // yet, so we exclude them here rather than surface untradeable
+              // pairs. Re-enable by removing this filter once Bitget supports
+              // API trading for reality stocks. (Metals like PAXG/XAUT are
+              // ordinary spot tokens and stay.)
+              .filter((d) => assetClassMap.get(d.symbol) !== 'stock')
               .map((d) => {
                 const p = prices?.data?.find(
                   (p) => p.pair === `${d.quoteCoin}USDT`,
@@ -1428,6 +1488,7 @@ class BitgetExchange extends AbstractExchange implements Exchange {
                     : +d.minTradeUSDT / +(p?.price ?? 1)
                 const res = {
                   pair: d.symbol,
+                  assetClass: assetClassMap.get(d.symbol),
                   baseAsset: {
                     minAmount: +d.minTradeAmount,
                     maxAmount: +d.maxTradeAmount,
@@ -2524,6 +2585,69 @@ class BitgetExchange extends AbstractExchange implements Exchange {
 
   getUsage() {
     return limitHelper.getInstance().getLimits()
+  }
+
+  async getFundingRateHistory(
+    symbol: string,
+    from?: number,
+    to?: number,
+    limit?: number,
+    timeProfile = this.getEmptyTimeProfile(),
+  ): Promise<BaseReturn<FundingRateResponse[]>> {
+    if (!this.futures) {
+      return this.errorFutures(timeProfile)
+    }
+    const productType = this.getProductTypeBySymbol(symbol)
+    timeProfile =
+      (await this.checkLimits(
+        'getFuturesHistoricFundingRates',
+        20,
+        timeProfile,
+      )) || timeProfile
+    timeProfile = this.startProfilerTime(timeProfile, 'exchange')
+    // This Bitget endpoint paginates by page only (no time filter), so we pull
+    // the most recent page and filter to the requested window client-side.
+    return this.client
+      .getFuturesHistoricFundingRates({
+        symbol,
+        productType,
+        pageSize: `${Math.min(limit ?? 100, 100)}`,
+      })
+      .then((result) => {
+        timeProfile = this.endProfilerTime(timeProfile, 'exchange')
+        if (result.code !== '00000') {
+          throw new BitgetError(result.msg, +result.code)
+        }
+        const data =
+          (result.data as unknown as {
+            symbol: string
+            fundingRate: string
+            fundingTime: string
+          }[]) ?? []
+        return this.returnGood<FundingRateResponse[]>(timeProfile)(
+          data
+            .map((r) => ({
+              symbol: r.symbol,
+              fundingRate: parseFloat(r.fundingRate),
+              fundingTime: +r.fundingTime,
+            }))
+            .filter(
+              (r) =>
+                (from ? r.fundingTime >= +from : true) &&
+                (to ? r.fundingTime <= +to : true),
+            ),
+        )
+      })
+      .catch(
+        this.handleBitgetErrors(
+          this.getFundingRateHistory,
+          symbol,
+          from,
+          to,
+          limit,
+          this.endProfilerTime(timeProfile, 'exchange'),
+        ),
+      )
   }
 
   async getTrades(

@@ -2,6 +2,7 @@ import type {
   AllPricesResponse,
   BaseReturn,
   CandleResponse,
+  FundingRateResponse,
   CommonOrder,
   ExchangeInfo,
   FreeAsset,
@@ -103,6 +104,13 @@ export interface Exchange {
     startTime?: number,
     endTime?: number,
   ): Promise<BaseReturn<TradeResponse[]>>
+
+  getFundingRateHistory(
+    symbol: string,
+    from?: number,
+    to?: number,
+    limit?: number,
+  ): Promise<BaseReturn<FundingRateResponse[]>>
 
   getAllPrices(): Promise<BaseReturn<AllPricesResponse[]>>
 
@@ -337,6 +345,21 @@ abstract class AbsctractExchange implements Exchange {
     BaseReturn<(ExchangeInfo & { pair: string })[]>
   >
 
+  /**
+   * Authoritative, account-scoped SPOT instrument universe. Only exchanges whose
+   * per-account tradeable set diverges from the public feed override this
+   * (OKX Europe: eea.okx.com returns USDC/EUR spot, not the global USDT list).
+   * Requires API credentials on the instance. Default: not supported.
+   */
+  async getAccountSpotExchangeInfo(): Promise<
+    BaseReturn<(ExchangeInfo & { pair: string })[]>
+  > {
+    return this.returnBad(
+      this.getEmptyTimeProfile(),
+      [],
+    )(new Error('Method not supported'))
+  }
+
   /** Get all open orders for given pair
    * @param {string} symbol symbol to look for
    * @param {boolean} returnOrders return orders or orders count
@@ -388,6 +411,20 @@ abstract class AbsctractExchange implements Exchange {
     startTime?: number,
     endTime?: number,
   ): Promise<BaseReturn<TradeResponse[]>>
+
+  /**
+   * Get settled funding rate history for a futures symbol.
+   * @param {string} symbol Universal symbol
+   * @param {number} [from] Start time (ms, inclusive)
+   * @param {number} [to] End time (ms, inclusive)
+   * @param {number} [limit] Max records
+   */
+  abstract getFundingRateHistory(
+    symbol: string,
+    from?: number,
+    to?: number,
+    limit?: number,
+  ): Promise<BaseReturn<FundingRateResponse[]>>
 
   /**
    * Get all prices

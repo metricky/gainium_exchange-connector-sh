@@ -7,6 +7,122 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.16.4] - 2026-07-25
+
+### Fixed
+
+- **`getFundingRateHistory` now accepts our normalized pair on Hyperliquid and Kraken Futures instead of failing on it forever.** The funding registry can hold either the exchange's own symbol or our pair form, but both connectors assumed the exchange form: Hyperliquid passed the symbol straight in as `coin` (every other info call converts via `getCoinNameByPair`), so `BTC-USDC` got an HTTP 500 from the info API and surfaced as `NOTOK`; Kraken Futures passed it straight through as `symbol`, so `BTC-USD` got `[400] Argument invalid: symbol`. Both now normalize first — Hyperliquid via the existing (idempotent) coin lookup, Kraken only for dash-bearing symbols, since futures codes never contain one — so an already-correct symbol is untouched. Verified against the live public endpoints: HL `BTC-USDC` 500 vs `BTC` 267 rows; Kraken `BTC-USD` 400 vs `PF_XBTUSD` success.
+
+## [1.16.3] - 2026-07-18
+
+### Fixed
+
+- **Kraken Futures: a partially- or fully-filled resting order is no longer reported as `NEW`, which was causing the bot to re-buy the same size at the same price (forum #4924).** Kraken Futures reports a resting order with a raw status of `ENTERED_BOOK` / `partiallyFilled` / `untouched` even when `filled > 0`. `getOrderStatus` (primary) and `getAllOpenOrders` passed that raw status straight into `mapOrderStatus`, which lacked the Futures statuses (only spot `"partially filled"` with a space existed) so everything fell through to `NEW`. main-app keys off `PARTIALLY_FILLED`/`FILLED`, so the fill was never recorded and the bot opened the position again. Both futures paths now derive the status from `executedQty` vs `origQty` via a new `futures_deriveOrderStatus` helper (mirroring the `getOrderEvents` fallback: a terminal cancel/reject wins, otherwise fill-derived), and `mapOrderStatus` gained the Futures raw statuses plus an idempotent `PARTIALLY_FILLED` mapping so a derived status survives the re-map in `futures_convertOrder`. Unit repro: `src/exchange/exchanges/kraken/partial-fill.spec.ts` (10 assertions).
+
+## [1.16.1] - 2026-07-16
+
+### Fixed
+
+- **Hyperliquid: a persistent `clearinghouseState` 429 no longer crashes the whole connector process.** When the short-TTL clearinghouseState cache is enabled (`HL_CH_STATE_CACHE_MS>0`, set to `1500` in prod), `HyperliquidChStateCache.track()` registered the in-flight fetch with `void p.finally(cleanup)`. `.finally()` returns a *new* promise that re-raises `p`'s rejection; that derived chain had no `.catch()`, so although the primary consumer (`await run` in `fetchClearinghouseState`, caught by the balance/positions fan-out) handled the error, the floating finally-chain surfaced it as an **unhandled rejection** — which Node ≥15 turns into a process exit. A sustained Hyperliquid rate-limit therefore killed the connector (pm2 auto-restarted it), cascading into main-app `balance … hyperliquidLinear` Internal Server Errors, `[Funding] NOTOK`, and market-archive backfill failures for that venue. The retry/backoff added in 1.15.x did not prevent this: it fires *before* the final rejection, and the crash came from the exhausted-retry rejection escaping via the un-caught finally-chain. `track()` now swallows the finally-chain rejection (`.finally(cleanup).catch(() => {})`); the real error is still handled by the awaiting consumer. Bug only manifests with the cache enabled (prod), which is why it never reproduced in local dev (cache defaults OFF).
+
+## [1.15.11] - 2026-07-15
+
+### Changed
+
+- **Kraken: rate-limit rejections now retry 3x with 30s spacing instead of 10x with <=10s backoff.** `EAPI:Rate limit exceeded` / `apiLimitExceeded` shared the generic retry policy (10 attempts, exponential backoff capped at 10s), so under sustained per-account saturation every throttled call spawned up to 10 more requests while Kraken's counter only decays at ~0.33-0.5/s -- amplifying the storm (2026-07-14: ~2.3k logged rate-limit errors fleet-wide in 4h). Rate-limit-class errors now get at most 3 attempts spaced 30s apart (sized to the counter decay); all other retryable errors keep the existing policy. Retries still re-enter `checkLimits`, preserving local budget accounting.
+
+## [1.15.10] - 2026-07-14
+
+### Fixed
+
+- Kraken `getAllOpenOrders` no longer throws `Cannot read properties of undefined (reading 'replace')` when called without a symbol. Every other connector treats `getAllOpenOrders(symbol?)` as "all open orders for the account" when the symbol is omitted (e.g. the fill-failsafe reconciliation path calls it with no symbol), and the connector's own HTTP layer declares `symbol` optional — but the Kraken implementation required it and unconditionally ran `toKrakenSymbol(symbol)`, so an undefined symbol reached `String.prototype.replace` in the symbol mapper and crashed. The crash was caught by `handleKrakenErrors` and returned as an error result, so Kraken open-order polling **failed silently** for affected accounts (bot could not see its open orders → risk of missed/duplicate order logic) rather than crash-looping. Kraken now honors the connector-family contract: with no symbol it returns all open orders (skips the per-symbol filter), and only maps+filters when a symbol is given. Both spot and futures branches are fixed.
+
+### Changed
+
+- `KrakenSymbolMapper.toKrakenSymbol` / `toOurSymbol` now return `''` for undefined/empty input instead of throwing on `.replace()` — a defensive guard for the mapper's ~30 call sites (widest-blast-radius `core/` code).
+- `handleKrakenErrors` now distinguishes connector-side JS faults (`TypeError`/`ReferenceError`/`RangeError`/`SyntaxError` with no error body/response) from genuine Kraken API rejections: they log as `Kraken connector error (<name>)` with a stack instead of masquerading as `Kraken API error`, so log-triage can tell a code bug from an exchange rejection.
+
+## [1.15.9] - 2026-07-14
+
+### Fixed
+
+- Hyperliquid signed actions no longer fail with `invalid nonce: duplicate nonce` under concurrent same-signer requests. The connector builds a fresh `ExchangeClient` per request, so the SDK's per-client nonce counter never spanned concurrent requests — two actions in the same millisecond emitted an identical `Date.now()` nonce (worst in cancel-heavy DCA/grid rebalances, which fire many single-order cancels back to back). A per-signer monotonic nonce is now shared across all in-process clients, and nonce collisions are added to the retry set for both Hyperliquid and Kraken (combo-bot Kraken legs hit the same class via `EAPI:Invalid nonce`). Nonce rejections are pre-execution, so re-signing with a fresh, higher nonce is safe and cannot double-place or double-cancel. This removes the transient, self-recovering `botError` alerts users were getting for it.
+
+### Changed
+
+- Bitget spot candle reads now page the recent `/spot/market/candles` endpoint at its documented max of 1000 candles/call (was 200), while `/spot/market/history-candles` stays correctly capped at 200. Each range read that stays inside the recent-lookback window now issues ~5x fewer upstream requests, which is the dominant driver of the `Bitget request must sleep` rate-limit churn in the connector fleet (getSpotCandles was the single largest source). Chunk striding in the mixed recent/historic path advances by the page size of the endpoint each chunk uses, so no bars are skipped. Futures candles are unchanged (they use the 200-capped history endpoint; raising them requires an endpoint switch, tracked separately).
+
+## [1.15.7] - 2026-07-12
+
+### Fixed
+
+- Kraken spot `submitOrder` no longer reports a just-placed order as "Order not found in open orders". After a successful submit we hold the order's txid, so the post-submit confirmation now retries the exact `getSpotOrderByTxid` (QueryOrders) lookup a few times to ride out Kraken's brief read-after-write lag before ever falling back to the ambiguous userref path — and the final fallback prefers the txid so `getOrder` re-routes through the exact `isKrakenSpotTxid` lookup. Previously a single QueryOrders miss dropped straight to the userref lookup, where every Gainium client id collapses to one shared userref (`parseInt(id.slice(0,8),16)` stops at the first non-hex char, e.g. all `CMB-*` → 12), so a live order could not be matched and combo/grid/dca placement surfaced a false failure.
+
+## [1.15.6] - 2026-07-11
+
+### Fixed
+
+- Hyperliquid connection verification now rejects an **API/agent wallet address** entered in place of the main account address. HL signs orders with the agent key but executes them on the master account, while every info request (balance/positions/orders) targets the address stored on the connection — so an agent address verified "fine" (an empty balance is a valid response) yet left the bot blind to its own positions and fills: `unknownOid` on order read-back, deals frozen with no recorded entry, and (via base-order retries) doubled positions with no take-profit. `verifyHyperliquid` now calls HL `userRole` on the entered address and, when it resolves to `role: "agent"`, fails verification with a clear message naming the correct main account address to use.
+
+### Reverted
+
+- Reverted the 1.15.5 Hyperliquid numeric-`oid` fallback in `getOrder`. It was built on a misdiagnosis — the observed `unknownOid` reports were either transient cloid lag already handled by the existing retry, or (the real case) an agent address being queried, which no order-read fallback can fix. The fallback added latency on the failing path without resolving any real defect. `getOrder`/`openOrder` return to the 1.15.4 behaviour.
+
+## [1.15.5] - 2026-07-11
+
+### Fixed
+
+- Hyperliquid orders no longer surface a spurious `unknownOid` error for orders the exchange actually accepted. After placing an order, `getOrder` re-fetched it **by cloid** (`newClientOrderId`); under load HL's cloid→oid index lags, so `orderStatus` returned `unknownOid`, and once the retry window (~9.5s) was exhausted the error propagated to the bot even though the order had been placed (and often filled). The place response already returns HL's **authoritative numeric `oid`** synchronously — `openOrder` now captures it and `getOrder` falls back to querying by that oid (which resolves immediately) before giving up. Prior fixes only lengthened the cloid retry window; this removes the root cause.
+
+## [1.15.4] - 2026-07-10
+
+### Fixed
+
+- Kraken Futures now records the **actual average fill price** instead of the limit price. `getOrderStatus`/`getOrderEvents` only expose an order's `limitPrice`, so a limit order that filled better than its limit (common for marketable base orders) was reported at the worse limit price — understating deal P/L (e.g. entry booked at 63528 when Kraken filled at 63264, showing +$1.52 net where the real result was ~+$2.79). `getOrder` now fetches `getFills` for filled orders, computes the size-weighted average execution price, and passes it through as `avgPrice` + `price` + `cummulativeQuoteQty` so main-app's fill logic resolves the true entry on both the placement and poll/reconcile paths. Falls back to the limit price when no fills match (or on a transient `getFills` error), so order recording never breaks.
+
+## [1.15.3] - 2026-07-10
+
+### Fixed
+
+- Kraken Futures rate-limit (`{error:"apiLimitExceeded", httpStatus:429}`) is now retried with backoff. The retry list only had spot's `EAPI:Rate limit exceeded`, so futures 429s were thrown straight through and surfaced to users as an uncategorized `apiLimitExceeded`.
+
+### Changed
+
+- `futures_changeLeverage` / `futures_changeMarginType` now dedupe redundant `setLeverageSettings` calls via a process-level cache of the last confirmed leverage-preference per (account, symbol). Multi-pair futures bots re-set leverage/margin on every deal open, spraying the `leveragepreferences` endpoint across pairs and self-inflicting the 429s above. Cache writes only on confirmed success; 30-min TTL self-heals external changes.
+
+## [1.15.2] - 2026-07-07
+
+### Fixed
+
+- Kraken xStock live prices: `getAllPrices` now also fetches the tokenized Ticker (`asset_class: tokenized_asset`), so deals on Kraken stock pairs get a last/mark price (Kraken serves it even out of hours) instead of "Price unavailable" (which also blocked unrealized P&L / TP-SL).
+
+
+## [1.15.1] - 2026-07-06
+
+### Fixed
+
+- Kraken xStock fees: `getUserFees`/`getAllUserFees` now fetch the tokenized universe (`aclass: tokenized_asset`), so fees resolve for stock pairs (e.g. PGx-USD) instead of throwing "Pair not found" → "User fee not found".
+
+
+## [1.15.0] - 2026-07-06
+
+### Added
+
+- Kraken spot now supports tokenized-equity ("xStocks") pairs (e.g. `AAPLx-USD`, `SPYx-USD`). Kraken hides these from the default `AssetPairs` response and rejects every per-pair call that omits the tokenized flag ("Unknown asset pair"), so none surfaced before. `getAllExchangeInfo` (spot) now makes a second `AssetPairs` call with `aclass: 'tokenized_asset'`, merges those pairs, tags each `assetClass: 'etf' | 'stock'` (ETF/index trackers curated in `KRAKEN_XSTOCK_ETFS`, everything else `'stock'`), and registers them via `KrakenSymbolMapper.setTokenized()`. Per-pair spot calls — `latestPrice` (Ticker), `getCandles` (OHLC), `getTrades` (RecentTrades) and `openOrder` (AddOrder) — inject `asset_class: 'tokenized_asset'` for tokenized symbols via `xstockParams()`. Param-name quirk preserved: `AssetPairs` uses `aclass`, all other calls use `asset_class`.
+- ADDITIVE + flag-gated: enabled by default, disabled with `KRAKEN_XSTOCKS_ENABLED=false`, and skipped in demo/testnet. Ordinary crypto Kraken spot/futures pairs are unaffected — they carry no `assetClass` and never receive the `asset_class` param.
+
+## [1.14.3] - 2026-07-06
+
+### Fixed
+
+- Kraken spot `getOrder` now resolves a Kraken order txid via QueryOrders (guarded by txid-format detection). main-app already translates our client id to the stored txid before polling Kraken order status (reconcile / checkOrdersAfterReconnect), but the connector could only look up by userref (`parseInt('O…',16)=NaN`), so that path never resolved — resting Kraken spot fills were never reconciled. This repairs the missed-fill reconcile backstop for Kraken (forum #4890); pairs with main-app preserving the local clientOrderId in the merge.
+
+## [1.14.2] - 2026-07-06
+
+### Fixed
+
+- Kraken spot order placement re-fetched the just-placed order by userref, which collides across ALL Gainium client order ids (shared "D-…"/"GRID-…" prefixes all parse to the same int) — with ≥2 such orders on an account, an instantly-filled market order came back as a DIFFERENT resting order (open, 0 filled) and the fill was silently never registered on the deal. Now resolves by the Kraken txid via QueryOrders (exact, state-independent), falling back to the legacy lookup. Also report the average executed price (not descr.price, which is '0' for market orders) in QueryOrders/closed-orders results.
+
 ## [1.14.1] - 2026-07-05
 
 ### Fixed

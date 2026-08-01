@@ -19,9 +19,11 @@ import type {
   TimeProfile,
   RebateRecord,
   RebateOverview,
+  KeyPermissions,
 } from './types'
 import { ExchangeIntervals, StatusEnum, PositionInfo } from './types'
 import { convertNumberToString } from '../utils/math'
+import { unknownPermissions } from './helpers/keyPermissions'
 
 export interface Exchange {
   returnGood<T>(
@@ -360,6 +362,20 @@ abstract class AbsctractExchange implements Exchange {
     )(new Error('Method not supported'))
   }
 
+  /**
+   * Authoritative, account-scoped FUTURES instrument universe. Only OKX Europe
+   * (eea.okx.com) overrides this — its X-Perps (instType=FUTURES, ruleType=xperp)
+   * are only visible via the private account endpoint. Default: not supported.
+   */
+  async getAccountFuturesExchangeInfo(): Promise<
+    BaseReturn<(ExchangeInfo & { pair: string })[]>
+  > {
+    return this.returnBad(
+      this.getEmptyTimeProfile(),
+      [],
+    )(new Error('Method not supported'))
+  }
+
   /** Get all open orders for given pair
    * @param {string} symbol symbol to look for
    * @param {boolean} returnOrders return orders or orders count
@@ -482,6 +498,21 @@ abstract class AbsctractExchange implements Exchange {
   abstract getRebateOverview(
     timestamp: number,
   ): Promise<BaseReturn<RebateOverview>>
+
+  /**
+   * What the exchange says these credentials are allowed to do — above all,
+   * whether they can withdraw. Gainium only ever needs read + trade, and until
+   * this existed we relied on users happening to create trade-only keys.
+   *
+   * Concrete (not abstract) on purpose: an exchange that cannot answer inherits
+   * `unknown` and nothing downstream breaks. Overriding is opt-in per venue,
+   * and `unknown` must never be read as a failure.
+   */
+  async getKeyPermissions(): Promise<KeyPermissions> {
+    return unknownPermissions(
+      'This exchange does not expose API-key permissions',
+    )
+  }
 }
 
 export default AbsctractExchange

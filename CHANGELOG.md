@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.18.1] - 2026-08-01
+
+### Fixed
+
+- Bitget: `wtow` is no longer treated as a withdrawal authority. The code was inferred rather than documented, and the authority sets returned by live keys contradict it — Bitget makes IP-binding mandatory on withdrawal-enabled keys, yet keys carrying `wtow` are markedly *less* likely to be IP-bound than keys without it, the opposite of what a real withdrawal permission would produce. Since main-app refuses a new connection whose key reports `withdraw: 'yes'`, this was wrongly turning away legitimate Bitget connections, citing a permission the key did not have. `chow`, the other plausible candidate, shows the same inverted pattern and is likewise not withdrawal; neither is added to the known-non-withdrawal list, since ruling a code out is not the same as knowing what it grants, so their keys still resolve to `unknown`.
+
+## [1.18.0] - 2026-07-31
+
+### Added
+
+- Withdrawal-permission detection for exchange API keys. `getKeyPermissions()` reports what a key is allowed to do — withdrawal, internal transfer, IP allowlist — per exchange (Binance `apiRestrictions`, Bybit `query-api`, KuCoin `user/api-key`, OKX `account/config`, Bitget `spot/account/info`, Coinbase `key_permissions`, Kraken via a `WithdrawMethods` probe). Gainium only ever needs read + trade, and withdrawal is never required by any feature; until now nothing verified that a stored key was actually limited that way.
+- `VerifyResponse.permissions` (optional, additive) and a new `GET /keyPermissions` endpoint for periodic re-auditing without running a full verification.
+- Hyperliquid: detect a pasted **master** private key. An API/agent wallet key can only trade, a master key can withdraw; the account address was validated but the secret never was. The signer address is now derived with the SDK's own `getWalletAddress` and compared against the account.
+
+### Notes
+
+- Every state is tri-state; `unknown` never means `no`. The probe runs concurrently with verification, cannot change a verify verdict, and rejects nothing — reject-vs-flag policy lives in main-app, which knows whether a connection is new.
+
+## [1.17.0] - 2026-07-30
+
+### Added
+
+- OKX Europe X-Perp futures (instType=FUTURES, ruleType=xperp) on the okxLinear rail for okxSource=my: instFamily->instId symbol translation with expiry-roll cache, account-scoped `GET /exchange/account/futures` instrument endpoint, `okxsource` on `GET /exchange/all`, X-Perp candles/tickers/funding on keyless clients, and X-Perp tickers merged into the futures price list. Contributed by community member discord2020 (forum topic 4925).
+
+## [1.16.9] - 2026-07-29
+
+### Fixed
+
+- **Kraken: the public (per-IP) rate limit is now retried with backoff instead of failing instantly (bug #181).** Kraken returns its public-endpoint limit as HTTP **200** with `{"error":["EGeneral:Too many requests"]}` in the body, so it matched neither the spot/futures strings in `retryErrors` nor the numeric `httpStatus` entries — `shouldRetry` was always false. Every rejected `/public/OHLC` call returned `NOTOK` immediately and the market-archive backfiller simply re-requested, so the six-node egress fleet hammered Kraken continuously instead of riding the limit out: prod node 40 logged 142 of 145 error lines with this signature and **zero** `Retrying after` lines, leaving candle backfill gapped and burying every other error on those nodes. The code is now in `retryErrors` and gets the same slow rate-limit pacing (3 attempts, 30s apart) as `EAPI:Rate limit exceeded`. It deliberately does **not** trigger `noteRateLimited()`: that downgrades an *account's* private REST tier, and a per-IP public rejection says nothing about any account's private budget. Covered by `src/exchange/exchanges/kraken/rate-limit.spec.ts`.
+
+## [1.16.8] - 2026-07-29
+
+### Added
+
+- **Kraken spot verify now rejects keys missing the "WebSocket interface" permission (issue #167 / ClickUp 86eyep5au).** Such a key passes the REST balance probe, so the connection looked healthy while the user-stream connector's `GetWebSocketsToken` call was rejected with `EGeneral:Permission denied` forever (16 users on 07-28) — the user was never told and their bots silently fell back to delayed reconcile-sweep-only fill delivery. `verifyKraken` now calls the new `Kraken.verifyWebsocketPermission()` (a `GetWebSocketsToken` probe) after the balance check and fails with a user-facing reason naming the exact Kraken setting to enable, following the Hyperliquid agent-address guard precedent. Only a definite `EGeneral:Permission denied` rejects; transient errors (rate limit, 5xx) never block verification. Spot-only — Kraken Futures WS auth signs a challenge with the key itself and has no separate permission.
+
+### Fixed
+
+- **Kraken: retries no longer re-invoke the method with garbled arguments.** `handleKrakenErrors` retries with `cb.call(this, ...args)`, but 19 call sites passed only the timeProfile — so any retryable Kraken error re-called the method with the TimeProfile object in the first parameter slot (`symbol`/`order`), surfacing as unhandled `TypeError: ourSymbol.replace is not a function` 500s (prod: `latestPrice` since June, `getCandles` on 2026-07-28 via WLFI-USD@krakenUsdm). Every call site now forwards the wrapped method's full argument list, matching the already-correct `getFundingRateHistory`/`futures_changeMarginType` sites.
+
+## [1.16.6] - 2026-07-28
+
+### Added
+
+- **`src/exchange/helpers/symbolCodec.ts` — the single home for pair-symbol format knowledge** (Phase 1 of the symbol-format cleanup behind bug #153). Defines the canonical dashed `BASE-QUOTE` form and the adapter contract: resolve wire symbols through the asset map in one place per adapter, never fabricate a wire symbol on a lookup miss (return `null` → one-attempt `NOTOK Unknown pair`), and pass already-wire symbols through unchanged. Fallback-on-miss is only permitted while the asset map itself is unavailable, so a transient refresh outage degrades instead of hard-failing.
+
+### Fixed
+
+- **Hyperliquid: the two remaining fabrication holes now reject unknown symbols in one attempt instead of retrying HL's `500/null` for ~93s.** The 1.16.5 fix covered futures `getCandles` only; spot `getCandles` still passed an unknown pair through unchanged, and `getFundingRateHistory`'s coin lookup fell back to `split('-')[0]` — both forwarded fabricated coins to Hyperliquid. Both now resolve strictly (`resolveSpotCoin` / `resolveFuturesCoin`) and return `NOTOK Unknown Hyperliquid pair <symbol>` immediately. Verified against the live public API: pair, wire-coin and code forms all still return data (candles futures+spot, funding); compact forms reject in ≤1ms.
+
 ## [1.16.4] - 2026-07-25
 
 ### Fixed

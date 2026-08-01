@@ -22,7 +22,12 @@ import {
   TimeProfile,
   RebateOverview,
   RebateRecord,
+  KeyPermissions,
 } from '../../types'
+import {
+  parseBitgetAccountInfo,
+  unknownPermissions,
+} from '../../helpers/keyPermissions'
 import {
   RestClientV2 as BitgetClient,
   FuturesKlineInterval,
@@ -852,22 +857,20 @@ class BitgetExchange extends AbstractExchange implements Exchange {
     }
 
     const productType = this.getProductTypeBySymbol(symbol)
+    // `getFuturesHistoricCandles` maps to `/api/v2/mix/market/history-candles`,
+    // which serves the FULL history at 200 rows per page. (The ~90-day
+    // retention window belongs to the other endpoint, `/mix/market/candles`,
+    // which we do not call here.) So there is no date floor to apply — the
+    // work is bounded by page count instead, so a nonsensical range still
+    // cannot spin.
     const maxSize = 200
-    const oldestDate = new Date(
-      +new Date() - 89 * 24 * 60 * 60 * 1000,
-    ).setHours(0, 0, 0, 0)
-    if (from && from < oldestDate) {
-      from = oldestDate
-      if (to && to < from) {
-        return this.returnGood<CandleResponse[]>(timeProfile)([])
-      }
-    }
+    const maxPages = 400 // 80k candles; callers chunk at 200/request
     const candlesSize =
       to && from ? (+to - +from) / timeIntervalMap[interval] : maxSize
     if (candlesSize > maxSize && from && to) {
       to = +from + maxSize * timeIntervalMap[interval]
     }
-    const i = Math.ceil(candlesSize / maxSize)
+    const i = Math.min(Math.ceil(candlesSize / maxSize), maxPages)
     const allCandles: CandleResponse[] = []
     for (let attempt = 1; attempt <= i; attempt++) {
       try {
@@ -913,12 +916,6 @@ class BitgetExchange extends AbstractExchange implements Exchange {
         }
         if (from && to) {
           from = +to + timeIntervalMap[interval]
-          if (from < oldestDate) {
-            from = oldestDate
-            if (+to < +from) {
-              break
-            }
-          }
           to = +from + maxSize * timeIntervalMap[interval]
         }
       } catch (e) {
@@ -1125,6 +1122,28 @@ class BitgetExchange extends AbstractExchange implements Exchange {
         min: a.minLeverage ? +a.minLeverage : 1,
       })),
     )
+  }
+
+  /**
+   * GET /api/v2/spot/account/info — the same call getApiPermission() makes,
+   * read for `authorities` (permission codes) and `ips` (allowlist, a
+   * comma-separated string here rather than an array).
+   *
+   * Bitget does not publish the authority-code vocabulary, so the parser
+   * answers `unknown` rather than `no` when it meets a code it does not
+   * recognise. See parseBitgetAccountInfo.
+   */
+  override async getKeyPermissions(): Promise<KeyPermissions> {
+    return this.client
+      .getSpotAccount()
+      .then(
+        (result) =>
+          parseBitgetAccountInfo(result?.data) ??
+          unknownPermissions('Unrecognised Bitget account info response'),
+      )
+      .catch((e) =>
+        unknownPermissions(`Bitget account info failed: ${e?.message ?? e}`),
+      )
   }
 
   async getApiPermission(

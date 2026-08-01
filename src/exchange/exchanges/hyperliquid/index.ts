@@ -22,13 +22,17 @@ import {
   TimeProfile,
   RebateOverview,
   RebateRecord,
+  KeyPermissions,
 } from '../../types'
 import * as hl from '@nktkas/hyperliquid'
+import { getWalletAddress } from '@nktkas/hyperliquid/signing'
+import { unknownPermissions } from '../../helpers/keyPermissions'
 import limitHelper from './limit'
 import { makeSharedNonce } from './nonce'
 import { Logger } from '@nestjs/common'
 import { sleep } from '../../../utils/sleepUtils'
 import { IdMute, IdMutex } from '../../../utils/mutex'
+import { splitDashedPair } from '../../helpers/symbolCodec'
 
 type OrderResponseMissing = {
   status: 'unknownOid'
@@ -462,25 +466,6 @@ class HyperliquidAssets {
     return this.assetClassByBase.get(baseTicker)
   }
 
-  @IdMute(mutex, () => 'getCoinNameByPair')
-  public async getCoinNameByPair(pair: string, market: Market) {
-    if (market === 'futures') {
-      const info = await this.getFuturesInfo(pair)
-      return info?.code ?? pair.split('-')[0]
-    }
-    if (
-      this.assetsSpot.size === 0 ||
-      this.lastUpdateSpot + this.updateInterval < Date.now()
-    ) {
-      await this.updateAssets('spot')
-    }
-    const code = this.assetsSpot.get(pair)
-    if (typeof code === 'undefined') {
-      return pair
-    }
-    return `${code === 0 ? 'PURR/USDC' : `@${code}`}`
-  }
-
   @IdMute(mutex, () => 'getCoinByPair')
   public async getPairByCoin(coin: string, market: Market) {
     if (market === 'futures') {
@@ -502,6 +487,53 @@ class HyperliquidAssets {
       return 'PURR-USDC'
     }
     return this.pairsSpot.get(+coin.replace('@', '')) ?? coin
+  }
+
+  /**
+   * Wire coin for a futures pair (`BTC-USDC`) or an already-resolved code
+   * (`BTC`) — or `null` when Hyperliquid lists neither, e.g. the compact
+   * `BTCUSDC` form some callers send. Callers must not forward an unlisted
+   * coin: HL answers `500` with a `null` body, which reads as a transient
+   * server error and gets retried (see `handleHyperliquidErrors`).
+   *
+   * While the asset map is unavailable (a failed refresh) we return the input
+   * unchanged, so a transient outage degrades to the old pass-through
+   * behaviour instead of rejecting every request.
+   */
+  public async resolveFuturesCoin(pair: string): Promise<string | null> {
+    const info = await this.getFuturesInfo(pair)
+    if (info) return info.code
+    if (this.futuresByCode.size === 0) return pair
+    const code = splitDashedPair(pair)?.base ?? pair
+    return this.futuresByCode.has(code) ? code : null
+  }
+
+  /**
+   * Wire coin for a SPOT pair (`PURR-USDC` → `PURR/USDC`, `UBTC-USDC` →
+   * `@142`) or an already-wire coin (`@142`, `PURR/USDC`) — or `null` when
+   * the spot asset map lists neither, e.g. the compact `PURRUSDC` form.
+   * Same contract as `resolveFuturesCoin` (see symbolCodec.ts): unknown
+   * symbols must be rejected in one attempt, not forwarded — HL answers
+   * `500`/`null` to an unlisted coin, which reads as transient and burns
+   * ~93s of retries. While the map is unavailable (failed refresh) the
+   * input passes through so an outage degrades instead of hard-failing.
+   */
+  @IdMute(mutex, () => 'resolveSpotCoin')
+  public async resolveSpotCoin(pair: string): Promise<string | null> {
+    if (
+      this.assetsSpot.size === 0 ||
+      this.lastUpdateSpot + this.updateInterval < Date.now()
+    ) {
+      await this.updateAssets('spot')
+    }
+    const code = this.assetsSpot.get(pair)
+    if (typeof code !== 'undefined') {
+      return code === 0 ? 'PURR/USDC' : `@${code}`
+    }
+    if (this.assetsSpot.size === 0) return pair
+    // Already-wire forms pass through unchanged.
+    if (pair === 'PURR/USDC' || /^@\d+$/.test(pair)) return pair
+    return null
   }
 
   public async getFuturesInfo(
@@ -1266,6 +1298,50 @@ class HyperliquidExchange extends AbstractExchange implements Exchange {
     }
   }
 
+  /**
+   * Hyperliquid has no permissioned API key — it holds a raw wallet private
+   * key — so "does this credential allow withdrawal?" reduces to "whose key is
+   * it?".
+   *
+   * An **API (agent) wallet** may only trade: HL blocks it from withdrawing or
+   * transferring. The **master** key can do everything, withdrawal included.
+   * `getAccountRole()` guards the *address* field against agent/master
+   * confusion, but the `secret` was never validated at all — nothing stopped a
+   * user pasting their master private key, handing Gainium a credential with
+   * full withdrawal capability. That is the same exposure as a withdrawal-
+   * enabled API key elsewhere, so it is reported the same way.
+   *
+   * The derivation is the SDK's own `getWalletAddress` — the very function that
+   * derives the signer when placing orders — so this cannot drift from what
+   * actually signs. Derivation failures answer `unknown`, never `no`.
+   */
+  override async getKeyPermissions(): Promise<KeyPermissions> {
+    let signer: string
+    try {
+      signer = await getWalletAddress(this.secret as `0x${string}`)
+    } catch (e) {
+      return unknownPermissions(
+        `Hyperliquid signer address underivable: ${(e as Error)?.message ?? e}`,
+      )
+    }
+    const account = `${this.key ?? ''}`.toLowerCase()
+    if (!account) {
+      return unknownPermissions('Hyperliquid account address missing')
+    }
+    const isMasterKey = signer.toLowerCase() === account
+    return {
+      // A master key can withdraw; an agent key provably cannot.
+      withdraw: isMasterKey ? 'yes' : 'no',
+      transfer: isMasterKey ? 'yes' : 'no',
+      // HL keys are bearer credentials with no IP binding whatsoever.
+      ipRestricted: 'no',
+      detail: isMasterKey
+        ? 'Secret is the master account private key (full withdrawal capability)'
+        : 'Secret is an API (agent) wallet key — trade only',
+      checkedAt: +new Date(),
+    }
+  }
+
   private errorFutures(timeProfile: TimeProfile) {
     return this.returnBad(timeProfile)(new Error('Futures type missed'))
   }
@@ -1642,11 +1718,18 @@ class HyperliquidExchange extends AbstractExchange implements Exchange {
     )
   }
 
-  private async getCoinNameByPair(pair: string, _force = false) {
-    return await HyperliquidAssets.getInstance().getCoinNameByPair(
-      pair,
-      this.futures ? 'futures' : 'spot',
-    )
+  /**
+   * Strictly resolve OUR symbol to the Hyperliquid wire coin for this
+   * instance's market, or `null` for a symbol the asset map doesn't list.
+   * Callers must reject a `null` in one attempt (`Unknown Hyperliquid pair`)
+   * instead of forwarding — see symbolCodec.ts for the contract and bug #153
+   * for what forwarding costs.
+   */
+  private async resolveCoin(pair: string): Promise<string | null> {
+    const assets = HyperliquidAssets.getInstance()
+    return this.futures
+      ? await assets.resolveFuturesCoin(pair)
+      : await assets.resolveSpotCoin(pair)
   }
 
   private async getPairByCoin(coin: string) {
@@ -2245,9 +2328,23 @@ class HyperliquidExchange extends AbstractExchange implements Exchange {
         return this.returnBad(timeProfile)(new Error('Response timeout'))
       }
     }
+    // Resolve the wire coin BEFORE the request. A symbol the asset map lists
+    // neither as a pair nor as a code — e.g. the compact 'BTCUSDC' instead of
+    // the 'BTC-USDC' pair form — would reach Hyperliquid as an unlisted coin.
+    // HL answers `500 / null`, `handleHyperliquidErrors` matches "server
+    // error" and retries 10x with a 10s sleep: ~93s and 10x the info weight
+    // burnt on a call that can never succeed, ending in an opaque reason.
+    // Every other dash-form exchange (okx/coinbase/kucoin) rejects an unknown
+    // symbol in one attempt with a readable reason — match that.
+    const coin = await this.resolveCoin(symbol)
+    if (coin === null) {
+      return this.returnBad(timeProfile)(
+        new Error(`Unknown Hyperliquid pair ${symbol}`),
+      )
+    }
     return this.infoClient
       .candleSnapshot({
-        coin: await this.getCoinNameByPair(symbol),
+        coin,
         interval,
         startTime: +from,
         endTime: +to,
@@ -3255,14 +3352,20 @@ class HyperliquidExchange extends AbstractExchange implements Exchange {
     const startTime = from ? +from : endTime - 7 * 24 * 60 * 60 * 1000
     timeProfile =
       (await this.checkLimits('fundingHistory', 20, timeProfile)) || timeProfile
+    // `fundingHistory` takes the coin, not the pair. Resolve strictly, same
+    // as getCandles: an unknown symbol forwarded as a coin draws HL's
+    // `500 / null` and 10 retries. Known pairs and already-coin symbols both
+    // resolve; only unlisted garbage is rejected.
+    const coin = await this.resolveCoin(symbol)
+    if (coin === null) {
+      return this.returnBad(timeProfile)(
+        new Error(`Unknown Hyperliquid pair ${symbol}`),
+      )
+    }
     timeProfile = this.startProfilerTime(timeProfile, 'exchange')
     return this.infoClient
       .fundingHistory({
-        // `fundingHistory` takes the coin, not the pair — every other info call
-        // converts (see getCandles); this one didn't, so a pair-form symbol
-        // (BTC-USDC) was sent verbatim and rejected. The conversion is a no-op
-        // for an already-coin symbol, so it is safe for both forms.
-        coin: await this.getCoinNameByPair(symbol),
+        coin,
         startTime,
         endTime,
       })

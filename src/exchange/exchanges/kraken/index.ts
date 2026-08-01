@@ -22,7 +22,12 @@ import {
   TimeProfile,
   RebateOverview,
   RebateRecord,
+  KeyPermissions,
 } from '../../types'
+import {
+  krakenWithdrawState,
+  unknownPermissions,
+} from '../../helpers/keyPermissions'
 import { SpotClient, DerivativesClient } from '../../../kraken-custom'
 import limitHelper from './limit'
 import { Logger } from '@nestjs/common'
@@ -418,6 +423,15 @@ class KrakenExchange extends AbstractExchange implements Exchange {
       'EService:Unavailable',
       'EService:Busy',
       'EGeneral:Temporary lockout',
+      // Kraken's *public* (per-IP) rate limit. Unlike the private counter it is
+      // delivered as HTTP **200** with the code in the body
+      // (`{"error":["EGeneral:Too many requests"],"httpStatus":200}`), so neither
+      // the spot/futures strings above nor the numeric httpStatus entries below
+      // ever matched it — public `/public/OHLC` rejections were thrown straight
+      // through with no backoff at all, and the archive backfiller simply
+      // re-requested, so the egress fleet hammered Kraken continuously
+      // (2026-07-28: 142 of 145 error lines on a single node, 0 retries logged).
+      'EGeneral:Too many requests',
       // Nonce collisions (spot `EAPI:Invalid nonce`; futures lowercase
       // `invalid nonce` / `duplicate nonce`) are pre-execution rejections — the
       // order/cancel never reached the matching engine — so re-signing with a
@@ -465,6 +479,12 @@ class KrakenExchange extends AbstractExchange implements Exchange {
 
   /**
    * Handle Kraken API errors with retry logic
+   *
+   * Call sites MUST pass the wrapped method's full argument list (ending with
+   * the timeProfile) — the retry re-invokes `cb.call(this, ...args)` verbatim.
+   * Passing only the timeProfile makes the retry call the method with the
+   * TimeProfile object in the first parameter slot (e.g. as `symbol`), which
+   * surfaced as "ourSymbol.replace is not a function" 500s.
    */
   private handleKrakenErrors<T>(
     cb: (...args: any[]) => Promise<T>,
@@ -557,13 +577,27 @@ class KrakenExchange extends AbstractExchange implements Exchange {
       // them retry attempts). Give these fewer, slower attempts sized to the
       // counter decay; each retry still re-enters checkLimits, so the local
       // budget accounting is preserved.
-      const isRateLimit = ['EAPI:Rate limit exceeded', 'apiLimitExceeded'].some(
-        (code) => actualError.includes(code) || e.message.includes(code),
-      )
-      // Adaptive tier: a real rate-limit rejection means this account's true
-      // Kraken budget is tighter than we assumed — drop it to Starter for a
-      // cooldown window (no-op unless per-account limits are enabled).
-      if (isRateLimit) {
+      const matches = (codes: string[]) =>
+        codes.some(
+          (code) => actualError.includes(code) || e.message.includes(code),
+        )
+      // Per-account (private REST) rate limits — spot and futures spellings.
+      const isAccountRateLimit = matches([
+        'EAPI:Rate limit exceeded',
+        'apiLimitExceeded',
+      ])
+      // Kraken's public endpoints are limited **per egress IP**, not per account
+      // (see exchange-balancer's `publicUrl` routing note). It saturates the same
+      // way, so it gets the same slow-retry pacing…
+      const isRateLimit =
+        isAccountRateLimit || matches(['EGeneral:Too many requests'])
+      // …but NOT the adaptive tier drop: a real *account* rate-limit rejection
+      // means that account's true Kraken budget is tighter than we assumed, so we
+      // drop it to Starter for a cooldown window (no-op unless per-account limits
+      // are enabled). An IP-level public rejection says nothing about any
+      // account's private budget — attributing it to one would throttle an
+      // unrelated account's private throughput for congestion it did not cause.
+      if (isAccountRateLimit) {
         limitHelper.noteRateLimited(hashKrakenKey(this.key))
       }
       const maxAttempts = isRateLimit ? 3 : this.retry
@@ -1039,6 +1073,87 @@ class KrakenExchange extends AbstractExchange implements Exchange {
       )
   }
 
+  /**
+   * Check the key can mint a WS auth token (spot "WebSocket interface"
+   * permission). A REST-only key passes every other verify probe but leaves
+   * the user-stream connector unable to subscribe (`EGeneral:Permission
+   * denied` on `GetWebSocketsToken`), so the user silently loses realtime
+   * order updates and falls back to delayed reconcile-sweep fills — surface
+   * it at verify time instead. Spot-only: Kraken Futures WS auth signs a
+   * challenge with the key itself and has no separate permission. Only a
+   * definite permission rejection reports `ok:false`; transient failures
+   * (rate limit, 5xx) never block verification.
+   */
+  async verifyWebsocketPermission(): Promise<{ ok: boolean; reason: string }> {
+    if (!this.spotClient) {
+      return { ok: true, reason: '' }
+    }
+    const isPermissionDenied = (s: string) =>
+      /EGeneral\s*:?\s*Permission denied/i.test(s)
+    try {
+      const res = await this.spotClient.getWebSocketsToken()
+      const errors: string[] = Array.isArray((res as any)?.error)
+        ? (res as any).error
+        : []
+      if (errors.some(isPermissionDenied)) {
+        return { ok: false, reason: errors.join(',') }
+      }
+      return { ok: true, reason: '' }
+    } catch (e: any) {
+      const msg = e?.body?.error?.join?.(',') || e?.message || `${e}`
+      if (isPermissionDenied(msg)) {
+        return { ok: false, reason: msg }
+      }
+      return { ok: true, reason: '' }
+    }
+  }
+
+  /**
+   * Kraken publishes nothing that describes a key's own permissions, so it is
+   * the only venue we have to probe. `POST /0/private/WithdrawMethods` requires
+   * BOTH "Funds permissions - Query" and "Funds permissions - Withdraw", and
+   * only lists methods — it moves no money.
+   *
+   * Because two permissions gate it, a bare denial is ambiguous: it could mean
+   * "no withdrawal" or "no funds-query at all". So we first confirm funds-query
+   * works via Balance; only then does a denial prove the key cannot withdraw.
+   * Anything else is `unknown`. Kraken exposes no IP-binding field.
+   */
+  override async getKeyPermissions(): Promise<KeyPermissions> {
+    if (!this.spotClient) {
+      return unknownPermissions(
+        'Kraken Futures keys do not expose withdrawal permission',
+      )
+    }
+    const errorsOf = (res: unknown): string[] =>
+      Array.isArray((res as any)?.error) ? (res as any).error : []
+    let queryFundsOk = false
+    try {
+      const balance = await this.spotClient.getAccountBalance()
+      queryFundsOk = !errorsOf(balance).length
+    } catch {
+      queryFundsOk = false
+    }
+    try {
+      const res = await this.spotClient.getWithdrawalMethods()
+      const errors = errorsOf(res)
+      if (!errors.length) {
+        return krakenWithdrawState({ queryFundsOk, withdrawMethodsOk: true })
+      }
+      return krakenWithdrawState({
+        queryFundsOk,
+        withdrawMethodsOk: false,
+        error: errors.join(','),
+      })
+    } catch (e: any) {
+      return krakenWithdrawState({
+        queryFundsOk,
+        withdrawMethodsOk: false,
+        error: e?.body?.error?.join?.(',') || e?.message || `${e}`,
+      })
+    }
+  }
+
   // ===========================
   // Orders
   // ===========================
@@ -1122,6 +1237,7 @@ class KrakenExchange extends AbstractExchange implements Exchange {
         .catch(
           this.handleKrakenErrors(
             this.openOrder,
+            order,
             this.endProfilerTime(timeProfile, 'exchange'),
           ),
         )
@@ -1200,6 +1316,7 @@ class KrakenExchange extends AbstractExchange implements Exchange {
       .catch(
         this.handleKrakenErrors(
           this.openOrder,
+          order,
           this.endProfilerTime(timeProfile, 'exchange'),
         ),
       )
@@ -1435,6 +1552,7 @@ class KrakenExchange extends AbstractExchange implements Exchange {
               // If both methods fail, return original error
               return this.handleKrakenErrors(
                 this.getOrder,
+                { symbol, newClientOrderId },
                 this.endProfilerTime(timeProfile, 'exchange'),
               )(historyError)
             }
@@ -1443,6 +1561,7 @@ class KrakenExchange extends AbstractExchange implements Exchange {
           // For other errors, use standard error handling
           return this.handleKrakenErrors(
             this.getOrder,
+            { symbol, newClientOrderId },
             this.endProfilerTime(timeProfile, 'exchange'),
           )(error)
         })
@@ -1570,6 +1689,7 @@ class KrakenExchange extends AbstractExchange implements Exchange {
             // If both methods fail, return original error
             return this.handleKrakenErrors(
               this.getOrder,
+              { symbol, newClientOrderId },
               this.endProfilerTime(timeProfile, 'exchange'),
             )(error)
           }
@@ -1578,6 +1698,7 @@ class KrakenExchange extends AbstractExchange implements Exchange {
         // For other errors, use standard error handling
         return this.handleKrakenErrors(
           this.getOrder,
+          { symbol, newClientOrderId },
           this.endProfilerTime(timeProfile, 'exchange'),
         )(error)
       })
@@ -1661,6 +1782,7 @@ class KrakenExchange extends AbstractExchange implements Exchange {
         .catch(
           this.handleKrakenErrors(
             this.cancelOrderByOrderIdAndSymbol,
+            order,
             this.endProfilerTime(timeProfile, 'exchange'),
           ),
         )
@@ -1703,6 +1825,7 @@ class KrakenExchange extends AbstractExchange implements Exchange {
       .catch(
         this.handleKrakenErrors(
           this.cancelOrderByOrderIdAndSymbol,
+          order,
           this.endProfilerTime(timeProfile, 'exchange'),
         ),
       )
@@ -1793,6 +1916,8 @@ class KrakenExchange extends AbstractExchange implements Exchange {
         .catch(
           this.handleKrakenErrors(
             this.getAllOpenOrders,
+            symbol,
+            returnOrders,
             this.endProfilerTime(timeProfile, 'exchange'),
           ),
         )
@@ -1855,6 +1980,8 @@ class KrakenExchange extends AbstractExchange implements Exchange {
       .catch(
         this.handleKrakenErrors(
           this.getAllOpenOrders,
+          symbol,
+          returnOrders,
           this.endProfilerTime(timeProfile, 'exchange'),
         ),
       )
@@ -1895,6 +2022,7 @@ class KrakenExchange extends AbstractExchange implements Exchange {
         .catch(
           this.handleKrakenErrors(
             this.latestPrice,
+            symbol,
             this.endProfilerTime(timeProfile, 'exchange'),
           ),
         )
@@ -1929,6 +2057,7 @@ class KrakenExchange extends AbstractExchange implements Exchange {
       .catch(
         this.handleKrakenErrors(
           this.latestPrice,
+          symbol,
           this.endProfilerTime(timeProfile, 'exchange'),
         ),
       )
@@ -2371,6 +2500,7 @@ class KrakenExchange extends AbstractExchange implements Exchange {
       .catch(
         this.handleKrakenErrors(
           this.getUserFees,
+          symbol,
           this.endProfilerTime(timeProfile, 'exchange'),
         ),
       )
@@ -2529,6 +2659,11 @@ class KrakenExchange extends AbstractExchange implements Exchange {
         .catch(
           this.handleKrakenErrors(
             this.getCandles,
+            symbol,
+            interval,
+            from,
+            to,
+            count,
             this.endProfilerTime(timeProfile, 'exchange'),
           ),
         )
@@ -2599,6 +2734,11 @@ class KrakenExchange extends AbstractExchange implements Exchange {
       .catch(
         this.handleKrakenErrors(
           this.getCandles,
+          symbol,
+          interval,
+          from,
+          to,
+          count,
           this.endProfilerTime(timeProfile, 'exchange'),
         ),
       )
@@ -2714,6 +2854,10 @@ class KrakenExchange extends AbstractExchange implements Exchange {
         .catch(
           this.handleKrakenErrors(
             this.getTrades,
+            symbol,
+            _fromId,
+            _startTime,
+            _endTime,
             this.endProfilerTime(timeProfile, 'exchange'),
           ),
         )
@@ -2762,6 +2906,10 @@ class KrakenExchange extends AbstractExchange implements Exchange {
       .catch(
         this.handleKrakenErrors(
           this.getTrades,
+          symbol,
+          _fromId,
+          _startTime,
+          _endTime,
           this.endProfilerTime(timeProfile, 'exchange'),
         ),
       )
@@ -2851,6 +2999,8 @@ class KrakenExchange extends AbstractExchange implements Exchange {
       .catch(
         this.handleKrakenErrors(
           this.futures_changeLeverage,
+          symbol,
+          leverage,
           this.endProfilerTime(timeProfile, 'exchange'),
         ),
       )
@@ -3032,6 +3182,7 @@ class KrakenExchange extends AbstractExchange implements Exchange {
       .catch(
         this.handleKrakenErrors(
           this.futures_getPositions,
+          symbol,
           this.endProfilerTime(timeProfile, 'exchange'),
         ),
       )

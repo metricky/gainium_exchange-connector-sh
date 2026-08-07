@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.19.1] - 2026-08-07
+
+### Fixed
+
+- Kraken signed REST requests now draw their nonce from a per-API-key counter shared across the whole process, instead of the SDK's per-client-instance one. Kraken requires the nonce for a key to strictly increase, and `@siebly/kraken-api` seeds `apiRequestNonce` as a field initialiser on each client — a guard that only covers requests sharing one instance. The connector builds a fresh exchange, and therefore a fresh `SpotClient`/`DerivativesClient`, for every request, so two concurrent calls on one key each read the same millisecond and emitted an identical nonce: Kraken accepted one and rejected the other with `EAPI:Invalid nonce`. This is the same defect Hyperliquid had (fixed 2026-07-14 with `hyperliquid/nonce.ts`); Kraken was given only the matching `retryErrors` entries at the time, which masked the collisions instead of preventing them, at the cost of a retry ladder on the affected calls. Note this closes the same-process window only — instances are separate processes and do not share the counter.
+
+## [1.19.0] - 2026-08-05
+
+### Added
+
+- `GET /marginAvailableUsd` reports the USD margin available on pooled-collateral futures accounts, implemented for Kraken Futures' flex (`multiCollateralMarginAccount`) and defaulting to `null` — "no opinion" — on every other venue and account type. Kraken pools all collateral currencies into one cross-margin account, so a wallet funded only in EUR can still margin a USD-quoted perpetual; the per-currency balances from `/balance` show no USD at all in that case, which reads as an empty account to anything sizing off the quote asset. This is deliberately a separate endpoint rather than a synthetic entry in `/balance`: that list is also summed to value a user's portfolio, so publishing the pooled USD figure there next to the per-currency holdings would count the same money twice. Callers must treat `null` as "fall back to the quote-asset balance".
+
+## [1.18.4] - 2026-08-04
+
+### Fixed
+
+- A declared IP allowlist can now only ever prove the positive: a populated list answers `yes`, and empty, absent **or an explicit `*` wildcard** all answer `unknown`. 1.18.3 still treated `['*']` as the exchange affirmatively stating "any IP" and returned `no`. That was wrong, and measurably so — Bybit emits `['*']` rather than `[]`, so of 443 credentials re-probed after 1.18.3 shipped, **441 came back `no`**: the change accomplished nothing for the exchange that motivated it. A wildcard is not a claim that the key is unrestricted; it means the key's own allowlist is empty, which is equally true of a key bound through the connect-a-third-party-app flow where the binding lives on the exchange's side. Such keys report `['*']` and still reject calls from unpublished addresses. The cost is deliberate: `ipRestricted` is now effectively binary (`yes`/`unknown`) and no key can be declared unprotected from this field alone — establishing that requires the two-sided capability probe. Binance is unaffected and can still answer `no`, because it declares `ipRestrict` as an explicit boolean rather than an allowlist to be inferred from.
+
+## [1.18.3] - 2026-08-03
+
+### Fixed
+
+- An empty IP allowlist now answers `unknown` on **every** exchange, not just Bybit. 1.18.2 kept `'no'` for a present-but-empty field on OKX and Bitget on the reasoning that an empty field is the exchange affirmatively reporting no allowlist. That reasoning was wrong: OKX ("Linking third-party apps") and Bitget offer the same connect-a-third-party-app flow as Bybit, which provisions the key and configures its IP binding on the exchange's side, where it does not appear in the key's own allowlist. A key created that way is genuinely bound, reports an empty allowlist, and still rejects calls from outside its binding. Gainium's own connection guides steer users into that flow, so these are the common case rather than an edge case. An empty allowlist therefore cannot distinguish "unrestricted" from "restricted somewhere not visible here", and is not evidence either way. A populated list remains a reliable positive and an explicit `['*']` wildcard remains a reliable negative.
+
+## [1.18.2] - 2026-08-03
+
+### Fixed
+
+- An empty IP allowlist is no longer read as "this key is unrestricted". The parsers previously flattened three different situations into `[]` and answered `ipRestricted: 'no'` for all of them: an allowlist the exchange reported as empty, a field the exchange omitted entirely, and — on Bybit — an allowlist that is empty in the API response while the key is in fact bound, because bindings made through Bybit's third-party-app flow are held on Bybit's side rather than in the key's own allowlist. A key in that last state reads empty here and still answers `10010 Unmatched IP` when called from an address outside its binding. The three are now distinguished: a populated list is `'yes'`, an explicit `['*']` wildcard is `'no'`, a present-but-empty field is `'no'`, an absent field is `'unknown'`, and for Bybit an empty list is `'unknown'` as well. Bitget (`ips`) and OKX (`ip`) no longer synthesise `[]` for a missing field. This follows the rule the module is built on — a parser that cannot tell must answer `unknown`, never `no` — and removes a false negative that reported IP-bound keys as unprotected.
+
 ## [1.18.1] - 2026-08-01
 
 ### Fixed

@@ -130,7 +130,7 @@ function main() {
         },
       }),
     ),
-    { withdraw: 'no', transfer: 'yes', ipRestricted: 'no', ips: [] },
+    { withdraw: 'no', transfer: 'yes', ipRestricted: 'unknown', ips: [] },
   )
   expect(
     'bybit: Withdraw in the Wallet group is caught',
@@ -159,10 +159,43 @@ function main() {
     })?.withdraw,
     'yes',
   )
+  // A wildcard is NOT proof the key is unrestricted, and it is not one IP
+  // literally named "*" either. Bybit emits ["*"] for keys bound through its
+  // third-party-app flow, where the binding lives on Bybit's side and never
+  // appears in the key's own allowlist — such a key reports ["*"] here and
+  // still answers 10010 Unmatched IP from an unpublished address. Measured:
+  // when this returned 'no', 441 of 443 re-probed credentials were labelled
+  // unprotected while bound.
   expect(
-    'bybit: ["*"] means unrestricted, not one IP named "*"',
+    'bybit: ["*"] is unknown — it is absence of a local allowlist, not proof of none',
     parseBybitApiKey({ ips: ['*'], permissions: { Wallet: [] } })?.ipRestricted,
-    'no',
+    'unknown',
+  )
+  expect(
+    'okx: a "*" allowlist is likewise unknown',
+    parseOkxAccountConfig({ perm: 'read_only,trade', ip: '*' })?.ipRestricted,
+    'unknown',
+  )
+  // Bybit reports `ips: []` for keys bound through its third-party-app flow,
+  // where the addresses live on Bybit's side rather than in the key's own
+  // allowlist. Such a key reads empty here and still answers `10010 Unmatched
+  // IP` from an address outside its binding — so empty cannot mean unbound.
+  // A wrong 'no' here reports a protected key as exposed.
+  expect(
+    'bybit: an EMPTY allowlist is unknown, not "unrestricted"',
+    parseBybitApiKey({ ips: [], permissions: { Wallet: [] } })?.ipRestricted,
+    'unknown',
+  )
+  expect(
+    'bybit: a missing ips field is likewise unknown',
+    parseBybitApiKey({ permissions: { Wallet: [] } })?.ipRestricted,
+    'unknown',
+  )
+  expect(
+    'bybit: a populated allowlist is still a reliable positive',
+    parseBybitApiKey({ ips: ['1.2.3.4'], permissions: { Wallet: [] } })
+      ?.ipRestricted,
+    'yes',
   )
   expect(
     'bybit: missing permissions block',
@@ -215,7 +248,7 @@ function main() {
   expect(
     'okx: the real perm string',
     shape(parseOkxAccountConfig({ perm: 'read_only,trade', ip: '' })),
-    { withdraw: 'no', transfer: 'unknown', ipRestricted: 'no', ips: [] },
+    { withdraw: 'no', transfer: 'unknown', ipRestricted: 'unknown', ips: [] },
   )
   expect(
     'okx: withdraw in perm is caught',
@@ -305,6 +338,37 @@ function main() {
     parseBitgetAccountInfo({ authorities: ['chow', 'coow', 'stow'], ips: '' })
       ?.withdraw,
     'unknown',
+  )
+  // Bitget, like Bybit and OKX, provisions keys through a "connect a
+  // third-party app" flow that binds the IPs on its own side — so a genuinely
+  // bound key reports no allowlist here. Neither an absent nor a blank field is
+  // evidence the key is unrestricted.
+  expect(
+    'bitget: a MISSING ips field is unknown, not "unrestricted"',
+    parseBitgetAccountInfo({ authorities: ['coow', 'cpow'] })?.ipRestricted,
+    'unknown',
+  )
+  expect(
+    'bitget: a present-but-blank ips field is ALSO unknown, not "unrestricted"',
+    parseBitgetAccountInfo({ authorities: ['coow', 'cpow'], ips: '' })
+      ?.ipRestricted,
+    'unknown',
+  )
+  expect(
+    'okx: a MISSING ip field is unknown, not "unrestricted"',
+    parseOkxAccountConfig({ perm: 'read_only,trade' })?.ipRestricted,
+    'unknown',
+  )
+  expect(
+    'okx: a present-but-blank ip is ALSO unknown (third-party-app binding)',
+    parseOkxAccountConfig({ perm: 'read_only,trade', ip: '' })?.ipRestricted,
+    'unknown',
+  )
+  expect(
+    'okx: a populated allowlist is still a reliable positive',
+    parseOkxAccountConfig({ perm: 'read_only,trade', ip: '1.2.3.4' })
+      ?.ipRestricted,
+    'yes',
   )
   expect(
     'bitget: empty authorities is not read as "no permissions"',

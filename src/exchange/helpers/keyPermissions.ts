@@ -52,15 +52,49 @@ export const unknownPermissions = (detail?: string): KeyPermissions => ({
 const state = (value: boolean | undefined | null): PermissionState =>
   value === true ? 'yes' : value === false ? 'no' : 'unknown'
 
-/** `[]` and `['*']` both mean "any IP" — Bybit uses the latter. */
+/**
+ * Resolves the IP-binding state from an exchange's declared allowlist.
+ *
+ * **A declared allowlist can only ever prove the positive.** A populated list
+ * names the bound addresses, so it answers `'yes'`. Everything else — empty,
+ * absent, or an explicit `'*'` wildcard — answers `'unknown'`. This helper
+ * never returns `'no'`, and that is deliberate.
+ *
+ * The reason is that Bybit, OKX and Bitget all offer a "connect a third-party
+ * app" flow, which provisions the key and configures its IP binding **on the
+ * exchange's side, where it does not appear in the key's own allowlist**. Such
+ * a key is genuinely bound and still answers `10003`/`10010 Unmatched IP` from
+ * an address outside its binding — while reporting either nothing or a
+ * wildcard here. Gainium's own connection guides steer users into that flow, so
+ * these are the common case rather than an edge case.
+ *
+ * A wildcard is therefore **not** the exchange stating "any IP"; it is the
+ * exchange stating "nothing in this key's own allowlist", which is equally true
+ * of a third-party-bound key. Measured on Bybit: after an earlier revision
+ * treated `['*']` as a reliable negative, 441 of 443 re-probed credentials came
+ * back `'no'` — i.e. the change accomplished nothing for the exchange that
+ * motivated it, because Bybit emits `['*']` and not `[]`.
+ *
+ * The cost is real: `ipRestricted` is now effectively binary, `'yes'` or
+ * `'unknown'`, and no key can be declared unprotected from this field alone.
+ * Determining that requires the two-sided capability probe (call from a
+ * whitelisted egress IP and from an unpublished one, and compare). This helper
+ * reports only what the exchange actually told us, per the module's standing
+ * rule: a parser that cannot tell must answer `unknown`, never `no`. A false
+ * `'no'` reports a protected key as exposed.
+ */
 const ipState = (
   ips: string[] | undefined,
 ): { ipRestricted: PermissionState; ips?: string[] } => {
   if (!Array.isArray(ips)) {
     return { ipRestricted: 'unknown' }
   }
-  const bound = ips.map((i) => `${i}`.trim()).filter((i) => i && i !== '*')
-  return { ipRestricted: bound.length ? 'yes' : 'no', ips: bound }
+  const bound = ips
+    .map((i) => `${i}`.trim())
+    .filter((i) => i && i !== '*')
+  return bound.length
+    ? { ipRestricted: 'yes', ips: bound }
+    : { ipRestricted: 'unknown', ips: bound }
 }
 
 /** Case-insensitive membership over a permission vocabulary. */
@@ -181,13 +215,16 @@ export const parseOkxAccountConfig = (
   if (!tokens.length) {
     return null
   }
+  // Same as Bitget: OKX's "Linking third-party apps" flow configures the IP
+  // binding on OKX's side, so a bound key reports an empty `ip`. Empty and
+  // absent both resolve to 'unknown'.
   const ips =
-    typeof c.ip === 'string' && c.ip.trim()
+    typeof c.ip === 'string'
       ? c.ip
           .split(',')
           .map((i) => i.trim())
           .filter(Boolean)
-      : []
+      : undefined
   return {
     withdraw: has(tokens, 'withdraw') ? 'yes' : 'no',
     // OKX folds internal transfers into `trade`/`withdraw` rather than
@@ -270,13 +307,16 @@ export const parseBitgetAccountInfo = (
   if (!tokens.length) {
     return null
   }
+  // `ips` is a comma-separated string when present. Neither absent nor blank is
+  // evidence the key is unbound — Bitget's third-party-app flow binds on its
+  // own side, so a bound key reports nothing here. Both resolve to 'unknown'.
   const ips =
-    typeof d.ips === 'string' && d.ips.trim()
+    typeof d.ips === 'string'
       ? d.ips
           .split(',')
           .map((i) => i.trim())
           .filter(Boolean)
-      : []
+      : undefined
   const isWithdraw = (t: string) =>
     BITGET_WITHDRAW_CODES.some((c) => t.includes(c))
   const isTransfer = (t: string) =>

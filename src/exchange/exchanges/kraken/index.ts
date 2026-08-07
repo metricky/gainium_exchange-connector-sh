@@ -32,6 +32,7 @@ import { SpotClient, DerivativesClient } from '../../../kraken-custom'
 import limitHelper from './limit'
 import { Logger } from '@nestjs/common'
 import { sleep } from '../../../utils/sleepUtils'
+import { safeStringify } from '../../../utils/redact'
 import { FuturesGetCandlesParams } from '@siebly/kraken-api'
 
 class KrakenError extends Error {
@@ -498,7 +499,24 @@ class KrakenExchange extends AbstractExchange implements Exchange {
       const httpStatus = errorObj.code || errorObj.response?.status || ''
       const errorBody = errorObj.body
       const errorResponse = errorObj.response
-      const requestParams = errorObj.requestParams || {}
+      // The arguments the wrapped method was actually called with, minus the
+      // trailing TimeProfile. NOT `errorObj.requestParams`: that is set only by
+      // @siebly/kraken-api's `parseException`, i.e. only when the SPOT client
+      // gets an HTTP-level failure. The futures path throws plain `Error`s
+      // raised by this file (e.g. `new Error(result.sendStatus.status)` ->
+      // "wouldNotReducePosition"), which carry no `requestParams`, so the log
+      // below rendered `openOrder called with params: {}` for every futures
+      // rejection — hiding the symbol/side/size needed to diagnose them.
+      // `args` is always present, is the caller-meaningful input, and (unlike
+      // the spot `requestParams`) never contains signed API-Key/API-Sign
+      // headers. See bug #310.
+      //
+      // Both this and `errorDetails` still go through `safeStringify`: the
+      // thrown object DOES carry live credentials (`requestParams.options
+      // .headers['API-Key'|'API-Sign']`, stapled on by @siebly/kraken-api's
+      // `parseException`), so any future edit that widens what gets logged
+      // here must not be able to put them in a pm2 log line.
+      const calledWithArgs = args.slice(0, -1)
 
       // Kraken API errors are in body.error or body.errors array
       let actualError: string
@@ -556,7 +574,7 @@ class KrakenExchange extends AbstractExchange implements Exchange {
         isJsError
           ? `[${httpStatus || 'NO_STATUS'}] Kraken connector error (${e.name}): ${actualError}`
           : `[${httpStatus || 'NO_STATUS'}] Kraken API error: ${actualError}`,
-        `Details: ${JSON.stringify(errorDetails)}, ${cb.name} called with params: ${JSON.stringify(requestParams)}${
+        `Details: ${safeStringify(errorDetails)}, ${cb.name} called with params: ${safeStringify(calledWithArgs)}${
           isJsError ? `, stack: ${e.stack}` : ''
         }`,
       )
@@ -600,12 +618,39 @@ class KrakenExchange extends AbstractExchange implements Exchange {
       if (isAccountRateLimit) {
         limitHelper.noteRateLimited(hashKrakenKey(this.key))
       }
-      const maxAttempts = isRateLimit ? 3 : this.retry
+      // A provider-wide OUTAGE (HTTP 5xx, or Kraken spot's own
+      // `EService:Unavailable`/`EService:Busy`) is not an ordinary per-request
+      // transient: every caller on every egress node is getting it at the same
+      // instant, and it lasts MINUTES, not milliseconds. The generic ladder is
+      // sized for a blip — 10 attempts at `min(1000 * 2^n, 10000)` = 74s of
+      // retrying and TEN logged error lines per failing call — so it cannot
+      // outlast a real outage and buys nothing by trying. Worse, the ramp is
+      // per-request state (`timeProfile.attempts`) and resets to zero on every
+      // new call, so the poll loop keeps starting fresh 74s ladders and the
+      // fleet re-requests at near-full rate into a dead provider.
+      // 2026-08-06: Kraken was down 07:01:45Z→07:16:38Z and all six nodes
+      // logged ~2,850 `[503] Kraken API error: Service Unavailable` lines
+      // (peak 141/min on .111) with in-flight getOrder calls stalling 76–89s.
+      // Note the observed message is the HTTP reason phrase `Service
+      // Unavailable`, which does NOT substring-match the `EService:Unavailable`
+      // code above — it is retryable only via the numeric `'503'` entry — so
+      // this class is matched on httpStatus as well as by name.
+      // Same treatment as the rate-limit class (bug #181): fewer, paced
+      // attempts. Ride out a short blip, then fail fast and let the caller's
+      // own loop retry, instead of camping on a dead endpoint.
+      const isProviderOutage =
+        matches(['EService:Unavailable', 'EService:Busy']) ||
+        ['500', '502', '503', '504', '520', '521', '522'].includes(
+          String(httpStatus),
+        )
+      const maxAttempts = isRateLimit || isProviderOutage ? 3 : this.retry
 
       if (shouldRetry && timeProfile.attempts < maxAttempts) {
         const waitTime = isRateLimit
           ? 30000
-          : Math.min(1000 * Math.pow(2, timeProfile.attempts), 10000)
+          : isProviderOutage
+            ? 5000
+            : Math.min(1000 * Math.pow(2, timeProfile.attempts), 10000)
         Logger.warn(
           `Retrying after ${waitTime}ms (attempt ${timeProfile.attempts + 1}/${maxAttempts})`,
         )
@@ -961,6 +1006,58 @@ class KrakenExchange extends AbstractExchange implements Exchange {
     )
   }
 
+  /**
+   * Kraken Futures pools every collateral currency into one flex account, so a
+   * wallet holding only EUR can still margin a USD-quoted perpetual. Report the
+   * venue's own `availableMargin` (USD) so order sizing stops reading the
+   * absent USD *quantity* as "no funds". Spot and the non-flex account types
+   * keep the base behaviour (`null` = use the quote-asset balance).
+   */
+  async getMarginAvailableUsd(
+    timeProfile = this.getEmptyTimeProfile(),
+  ): Promise<BaseReturn<number | null>> {
+    if (!this.usdm || !this.derivativesClient) {
+      return this.returnGood<number | null>(timeProfile, [])(null)
+    }
+
+    timeProfile =
+      (await this.checkLimits('getAccountBalance', undefined, timeProfile)) ||
+      timeProfile
+    timeProfile = this.startProfilerTime(timeProfile, 'exchange')
+
+    return this.derivativesClient
+      .getAccounts()
+      .then((result) => {
+        timeProfile = this.endProfilerTime(timeProfile, 'exchange')
+        if (result.result !== 'success' || !result.accounts) {
+          throw new Error(
+            `Failed to get margin. Result: ${result.result || 'undefined'}`,
+          )
+        }
+        const flex = result.accounts.flex
+        // Only the pooled account type has a cross-collateral figure worth
+        // reporting; anything else must fall back to the quote balance.
+        const available =
+          flex && typeof flex.availableMargin === 'number'
+            ? flex.availableMargin
+            : null
+        return this.returnGood<number | null>(
+          timeProfile,
+          [],
+        )(
+          available !== null && isFinite(available) && available >= 0
+            ? available
+            : null,
+        )
+      })
+      .catch(
+        this.handleKrakenErrors(
+          this.getMarginAvailableUsd,
+          this.endProfilerTime(timeProfile, 'exchange'),
+        ),
+      )
+  }
+
   async getBalance(
     timeProfile = this.getEmptyTimeProfile(),
   ): Promise<BaseReturn<FreeAsset>> {
@@ -986,7 +1083,7 @@ class KrakenExchange extends AbstractExchange implements Exchange {
               fullResponse: result,
             }
             throw new Error(
-              `Failed to get balance. Details: ${JSON.stringify(errorDetails)}`,
+              `Failed to get balance. Details: ${safeStringify(errorDetails)}`,
             )
           }
 
@@ -1869,7 +1966,7 @@ class KrakenExchange extends AbstractExchange implements Exchange {
               fullResponse: result,
             }
             throw new Error(
-              `Failed to get open orders. Details: ${JSON.stringify(errorDetails)}`,
+              `Failed to get open orders. Details: ${safeStringify(errorDetails)}`,
             )
           }
 

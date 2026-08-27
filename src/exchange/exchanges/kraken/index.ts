@@ -7,6 +7,7 @@ import {
   CommonOrder,
   ExchangeInfo,
   ExchangeIntervals,
+  AccountFill,
   FreeAsset,
   LeverageBracket,
   OrderStatusType,
@@ -28,12 +29,23 @@ import {
   krakenWithdrawState,
   unknownPermissions,
 } from '../../helpers/keyPermissions'
-import { SpotClient, DerivativesClient } from '../../../kraken-custom'
+import {
+  SpotClient,
+  DerivativesClient,
+  krakenNonceFromError,
+} from '../../../kraken-custom'
 import limitHelper from './limit'
+import { krakenLadderFee } from './fees'
 import { Logger } from '@nestjs/common'
+import { createHash } from 'crypto'
 import { sleep } from '../../../utils/sleepUtils'
 import { safeStringify } from '../../../utils/redact'
-import { FuturesGetCandlesParams } from '@siebly/kraken-api'
+import {
+  FuturesCancelOrderStatus,
+  FuturesGetCandlesParams,
+  FuturesOrderEvent,
+  FuturesOrderJson,
+} from '@siebly/kraken-api'
 
 class KrakenError extends Error {
   code: string
@@ -360,6 +372,103 @@ function krakenLeveragePrefMatches(
   )
 }
 
+/**
+ * The account's own rate per pair, from the PRIVATE `TradeVolume` endpoint.
+ *
+ * Fees used to come from the PUBLIC `AssetPairs` ladder's first entry — the
+ * highest tier, for the lowest volume — so every Kraken user on the platform
+ * traded against 0.40% taker / 0.25% maker no matter what they actually pay.
+ * That is not cosmetic: main-app grosses a spot base order up by `1 + taker`
+ * and sizes take-profits against the same number, so a user on a better tier
+ * silently over-buys on entry. Pair-scoped `TradeVolume` answers with the
+ * rate the account ACTUALLY pays — Kraken does the tier arithmetic, and a
+ * negotiated rate (which exists on no public ladder) comes back the same way.
+ * Cached briefly so the hourly sweep and per-pair callers don't re-ask.
+ */
+type KrakenAccountFees = {
+  /** The account's own rate for the asked pair — already a fraction, straight
+   *  from Kraken (volume tier or negotiated alike). Null when unanswerable. */
+  taker: number | null
+  maker: number | null
+}
+/** Keyed `<key fingerprint>:<pair|*>`; the raw API key is never stored. */
+const krakenTradeVolumeCache = new Map<
+  string,
+  KrakenAccountFees & { ts: number }
+>()
+const KRAKEN_TRADE_VOLUME_TTL = 10 * 60 * 1000
+const KRAKEN_ACCOUNT_FEES_UNKNOWN: KrakenAccountFees = {
+  taker: null,
+  maker: null,
+}
+
+/**
+ * Per-pair account rates from PAIR-SCOPED `TradeVolume` calls, per API key —
+ * the bulk-sweep counterpart of `getAccountFees`. Kraken only reveals what an
+ * account actually pays when asked about specific pairs (`fees` / `fees_maker`
+ * maps in a pair-scoped response), and that answer covers volume tiers and
+ * negotiated rates alike. Live example that forced this: an account with ~5k
+ * EUR of 30-day volume paying a negotiated 0.10% taker / 0.00% maker — no
+ * volume-derived placement can ever produce that.
+ */
+const krakenPairFeeMapCache = new Map<
+  string,
+  {
+    map: Map<string, { taker: number | null; maker: number | null }>
+    ts: number
+  }
+>()
+/** Pairs per TradeVolume request. ~700 Kraken pairs → ~14 calls per sweep. */
+const KRAKEN_TRADE_VOLUME_CHUNK = 50
+
+/**
+ * Last time an avg-fill-price lookup failure was logged, per
+ * `<key fingerprint>:<class>`. A key that lacks the permission fails on EVERY
+ * filled order, so logging each one would bury the signal it is meant to raise;
+ * a key that hits a 429 recovers by itself and does not deserve a line at all
+ * beyond the first. Process-local and unbounded only in the number of API keys
+ * this instance serves, which is already bounded by the connection pool.
+ */
+const krakenAvgPriceFailureLog = new Map<string, number>()
+const KRAKEN_AVG_PRICE_LOG_TTL = 60 * 60 * 1000
+
+/**
+ * How long after Kraken Futures logs an `OrderPlaced` we still accept that
+ * event as evidence the order is resting, when `getOrderStatus` has not caught
+ * up and reports the id as unknown.
+ *
+ * Beyond this the two answers stop being a race and start being a
+ * contradiction, and `getOrderStatus` — the live open-orders view — is the one
+ * that is actually about *now*. Erring the same way as main-app's
+ * `noteOrderNotFound` age floor: a venue that says "unknown id" about an order
+ * placed moments ago is describing its own propagation lag, and calling that a
+ * phantom would force-cancel an order about to appear on the book. 60s is far
+ * beyond any propagation delay observed on this venue and far short of the
+ * hours a real phantom persists.
+ */
+const KRAKEN_ORDER_PLACED_PROPAGATION_MS = 60 * 1000
+
+/**
+ * Does this failure mean "this key will never be allowed to read fills", as
+ * opposed to "try again later"?
+ *
+ * Kraken Futures answers a key that lacks the query-trades/history permission
+ * with `{result:'error', error:'authenticationError'}` at HTTP 200 — an
+ * application-layer refusal that looks nothing like a transport error — and the
+ * history API family refuses with a transport 401. Neither ever recovers on
+ * retry, so both must be visible; rate limits and 5xx must not be.
+ */
+export function isKrakenPermanentAuthFailure(reason: string): boolean {
+  const r = reason.toLowerCase()
+  return (
+    r.includes('authenticationerror') ||
+    r.includes('status code 401') ||
+    r.includes('status code 403') ||
+    r.includes('unauthorized') ||
+    r.includes('insufficient permission')
+  )
+}
+
 class KrakenExchange extends AbstractExchange implements Exchange {
   /** Kraken Spot client */
   protected spotClient?: SpotClient
@@ -555,6 +664,19 @@ class KrakenExchange extends AbstractExchange implements Exchange {
         // Fallback to basic error message
         actualError = e.message
         errorDetails = { message: e.message, httpStatus }
+      }
+
+      // The nonce the rejected request carried. Kraken scopes nonces per API
+      // key, so `EAPI:Invalid nonce` is the one error class you cannot diagnose
+      // from the message alone — a duplicate nonce and an out-of-order arrival
+      // log identically. Logging the value makes `pid + nonce` across the
+      // fleet's logs decide which it was. Spread rather than mutate:
+      // `errorDetails` may be a reference to the live response body above.
+      // Only the nonce is taken — `requestParams` also carries live API-Key /
+      // API-Sign headers (see the note on `calledWithArgs`).
+      const nonce = krakenNonceFromError(errorObj)
+      if (nonce) {
+        errorDetails = { ...errorDetails, nonce }
       }
 
       // Distinguish genuine Kraken API rejections from our own JS bugs. A bare
@@ -799,6 +921,170 @@ class KrakenExchange extends AbstractExchange implements Exchange {
   }
 
   /**
+   * Does this `/orders/status` element actually describe an order Kraken has?
+   *
+   * `getOrderStatus` answers about orders that are open, or were filled or
+   * cancelled in the last 5 seconds — and it returns an ELEMENT even for an id
+   * outside that window, carrying no usable `status` (absent, or a not-found
+   * marker) and often an `error`. That element is "we do not know this order",
+   * not a snapshot of it.
+   *
+   * The caller used to feed it through as `orderInfo.status || 'NEW'`, which
+   * turns "we do not know" into the one answer that means the opposite: NEW =
+   * resting on the book. Bug #366 is what that costs. A Kraken Futures grid
+   * order (`GRID-RO-1w23…` / `a26e32f1-…`) was gone from the venue, so every
+   * cancel came back `notFound` -> `Unknown order`, and main-app's
+   * `_handleUnknownOrder` then re-read it here and was told NEW. Because that
+   * is a SUCCESSFUL read, main-app cleared its `canceledMap` retry counter on
+   * each pass, so the 5-attempt force-cancel that exists for exactly this case
+   * could never be reached — the order sat at NEW in Mongo from 2026-08-05
+   * while the bot re-attempted the cancel ~4x/day indefinitely, holding a dead
+   * grid level.
+   *
+   * So: only a status Kraken documents for a real order is evidence about that
+   * order. Anything else falls through to the getOrderEvents lookup, which
+   * either resolves the true outcome or fails and lets the caller reconcile —
+   * the path already proven in production on `CMB-GR-…` orders, which reach
+   * "Order not found in history" and then main-app's force-cancel.
+   *
+   * Deliberately NOT relaxed into `mapOrderStatus`'s unknown -> NEW default:
+   * that default is shared with the spot paths and is not in evidence here.
+   *
+   * Pure — no network.
+   */
+  futures_isKnownOrderStatus(status?: string): boolean {
+    return [
+      'ENTERED_BOOK',
+      'FULLY_EXECUTED',
+      'REJECTED',
+      'CANCELLED',
+      'TRIGGER_PLACED',
+      'TRIGGER_ACTIVATION_FAILURE',
+    ].includes(`${status ?? ''}`.toUpperCase())
+  }
+
+  /**
+   * Size-weighted average execution price from a batch of Kraken order events.
+   *
+   * Kraken attaches `EXECUTION` events — each carrying an exact `price` and
+   * `amount` — to the responses for submitting, editing and cancelling an
+   * order. That is the venue stating what it actually filled, in the same
+   * round trip, for free. It is the ONLY execution-price source here that
+   * needs no second call and no extra permission, which matters because the
+   * `/fills` endpoint needs both.
+   *
+   * Returns `executedQty: 0` and no price when the batch carries no execution
+   * (e.g. a limit order that only rested), so callers can tell "nothing filled
+   * in this batch" from "filled at price X". Pure — no network.
+   */
+  futures_readExecutionPrice(events?: FuturesOrderEvent[]): {
+    executedQty: number
+    avgPrice?: number
+  } {
+    const executions = (events ?? []).filter(
+      (e): e is Extract<FuturesOrderEvent, { type: 'EXECUTION' }> =>
+        e.type === 'EXECUTION' && 'amount' in e,
+    )
+    const executedQty = executions.reduce((acc, e) => acc + (e.amount || 0), 0)
+    if (executedQty <= 0) {
+      return { executedQty: 0 }
+    }
+    return {
+      executedQty,
+      avgPrice:
+        executions.reduce(
+          (acc, e) => acc + (e.price || 0) * (e.amount || 0),
+          0,
+        ) / executedQty,
+    }
+  }
+
+  /**
+   * Read what Kraken says actually happened to a cancelled order.
+   *
+   * Kraken answers a cancel with `cancelStatus.status`:
+   * `'cancelled' | 'filled' | 'notFound'`. This used to be ignored in favour of
+   * a hardcoded `CANCELED` with no executed quantity — so a cancel that raced a
+   * fill reported the order as dead while the position stayed on the venue,
+   * leaving an untracked position with no TP and no SL and a deal short by the
+   * filled size. It also discarded PARTIAL fills on genuine cancels, and
+   * asserted a side/price it had never read.
+   *
+   * `unknown` means "do not claim to know": either Kraken could not find the
+   * order, or it says the order executed but gave us nothing to size the fill
+   * with. Both must reach the caller's unknown-order path so the real order is
+   * re-fetched, because inventing a quantity here would book a phantom fill.
+   *
+   * Pure — no network. Exercised by `cancel-verdict.spec.ts`.
+   */
+  futures_readCancelOutcome(cancelStatus?: FuturesCancelOrderStatus): {
+    unknown: boolean
+    rawStatus: string
+    executedQty: number
+    origQty: number
+    avgPrice?: number
+    limitPrice?: number
+    symbol?: string
+    clientOrderId: string
+    side: string
+    type: string
+  } {
+    const unknownOutcome = {
+      unknown: true,
+      rawStatus: 'cancelled',
+      executedQty: 0,
+      origQty: 0,
+      clientOrderId: '',
+      side: 'buy',
+      type: 'LIMIT',
+    }
+    if (!cancelStatus || cancelStatus.status === 'notFound') {
+      return unknownOutcome
+    }
+
+    const events = cancelStatus.orderEvents ?? []
+    // Every event carries a snapshot of the order it happened to, so side,
+    // quantity and limit price come from Kraken rather than being assumed.
+    const snapshot = events.reduce<FuturesOrderJson | undefined>(
+      (acc, e) =>
+        acc ??
+        ('order' in e
+          ? e.order
+          : 'orderPriorExecution' in e
+            ? e.orderPriorExecution
+            : 'old' in e
+              ? e.old
+              : undefined),
+      undefined,
+    )
+    // EXECUTION events are the fills the cancel raced. Prefer them over the
+    // snapshot's `filled`, which predates the executions in this same batch.
+    const { executedQty: executedFromEvents, avgPrice } =
+      this.futures_readExecutionPrice(events)
+    const executedQty = executedFromEvents || snapshot?.filled || 0
+
+    if (cancelStatus.status === 'filled' && executedQty <= 0) {
+      return unknownOutcome
+    }
+
+    return {
+      unknown: false,
+      // `filled` is Kraken's own word for "already fully executed". For
+      // `cancelled`, `futures_deriveOrderStatus` keeps CANCELED while the
+      // executed quantity above still carries any partial fill.
+      rawStatus: cancelStatus.status === 'filled' ? 'filled' : 'cancelled',
+      executedQty,
+      origQty: snapshot?.quantity || 0,
+      avgPrice,
+      limitPrice: snapshot?.limitPrice,
+      symbol: snapshot?.symbol,
+      clientOrderId: cancelStatus.cliOrdId ?? snapshot?.cliOrdId ?? '',
+      side: snapshot?.side || 'buy',
+      type: snapshot?.type || 'LIMIT',
+    }
+  }
+
+  /**
    * Map Kraken order type to common format
    */
   private mapOrderType(type: string): OrderTypeT {
@@ -916,12 +1202,24 @@ class KrakenExchange extends AbstractExchange implements Exchange {
     if (!this.derivativesClient || (!orderId && !clientOrderId)) return null
     try {
       const result = await this.derivativesClient.getFills()
-      if (result.result !== 'success' || !result.fills?.length) return null
+      if (result.result !== 'success') {
+        // An application-layer refusal at HTTP 200. This is where a key that
+        // lacks the query-trades permission lands, and where the old bare
+        // `catch` made a permanent failure indistinguishable from a blip.
+        this.logAvgFillPriceFailure(
+          `${(result as { error?: string }).error || result.result || 'unknown'}`,
+        )
+        return null
+      }
+      if (!result.fills?.length) return null
       const matches = result.fills.filter(
         (f) =>
           (clientOrderId && f.cliOrdId === clientOrderId) ||
           (orderId && f.order_id === orderId),
       )
+      // Not an error: `getFills()` returns Kraken's most recent page, so an
+      // order that filled outside it simply is not here. Callers fall back to
+      // the limit price, which for a resting limit order IS the fill price.
       if (!matches.length) return null
       let notional = 0
       let size = 0
@@ -931,10 +1229,49 @@ class KrakenExchange extends AbstractExchange implements Exchange {
       }
       if (size <= 0) return null
       return notional / size
-    } catch {
-      // getFills failed (e.g. transient 429) — fall back to the limit price rather
-      // than break order recording.
+    } catch (e) {
+      this.logAvgFillPriceFailure(e instanceof Error ? e.message : `${e}`)
+      // Never break order recording over a price refinement — the caller still
+      // records the order, at its limit price.
       return null
+    }
+  }
+
+  /**
+   * Surface an avg-fill-price lookup failure without either spamming the log or
+   * swallowing it.
+   *
+   * A permission failure is permanent: it recurs on every filled order for that
+   * key, forever, and silently downgrades the recorded price to the order's
+   * limit price. That is worth an error line. A 429 or a 5xx fixes itself and is
+   * worth at most a warning. Both are logged at most once an hour per key so a
+   * busy account cannot drown the signal.
+   *
+   * The key itself is NEVER logged — only a short non-reversible fingerprint,
+   * enough to tell two accounts apart. `reason` goes through `safeStringify`
+   * and is truncated because Kraken SDK error objects can carry live
+   * credentials, and a log line must never be the thing that leaks one.
+   */
+  private logAvgFillPriceFailure(reason: string) {
+    const permanent = isKrakenPermanentAuthFailure(reason)
+    const fingerprint = createHash('sha256')
+      .update(this.key ?? '')
+      .digest('hex')
+      .slice(0, 8)
+    const bucket = `${fingerprint}:${permanent ? 'auth' : 'transient'}`
+    const now = Date.now()
+    const last = krakenAvgPriceFailureLog.get(bucket)
+    if (last && now - last < KRAKEN_AVG_PRICE_LOG_TTL) return
+    krakenAvgPriceFailureLog.set(bucket, now)
+
+    const detail = safeStringify(reason).slice(0, 300)
+    const message =
+      `Kraken avg fill price unavailable for key ${fingerprint} ` +
+      `(${permanent ? 'PERMANENT — orders for this key are being recorded at their LIMIT price' : 'transient'}): ${detail}`
+    if (permanent) {
+      Logger.error(message)
+    } else {
+      Logger.warn(message)
     }
   }
 
@@ -947,7 +1284,21 @@ class KrakenExchange extends AbstractExchange implements Exchange {
     size: number
     price: number
     unrealizedFunding: number | null
+    /**
+     * The account's leverage preference for this contract: an isolated
+     * maxLeverage, `'cross'` when no isolated preference is set, or
+     * `undefined` when the preference could not be read.
+     */
+    leveragePref?: KrakenLeveragePref
   }): PositionInfo {
+    // Kraken's position payload carries no leverage — it is a per-contract
+    // account preference. This used to be hardcoded `'1'`, and the bot
+    // engine's pre-start check compared it with the bot's own leverage, so
+    // every Kraken futures bot above 1x refused to start into an existing
+    // position ("Leverage in active position is 1, but in settings 2"). Report
+    // the real isolated preference; `'0'` means "not an isolated leverage"
+    // (cross / dynamic, or unknown), which the consumer must not compare.
+    const isolated = typeof pos.leveragePref === 'number'
     return {
       symbol: pos.symbol,
       initialMargin: '0',
@@ -955,8 +1306,8 @@ class KrakenExchange extends AbstractExchange implements Exchange {
       unrealizedProfit: pos.unrealizedFunding?.toString() || '0',
       positionInitialMargin: '0',
       openOrderInitialMargin: '0',
-      leverage: '1',
-      isolated: false,
+      leverage: isolated ? `${pos.leveragePref}` : '0',
+      isolated,
       entryPrice: pos.price.toString(),
       maxNotional: '0',
       positionSide: pos.side === 'long' ? 'LONG' : 'SHORT',
@@ -1053,6 +1404,93 @@ class KrakenExchange extends AbstractExchange implements Exchange {
       .catch(
         this.handleKrakenErrors(
           this.getMarginAvailableUsd,
+          this.endProfilerTime(timeProfile, 'exchange'),
+        ),
+      )
+  }
+
+  /**
+   * Executions on this account, newest first. Read-only.
+   *
+   * The point of this endpoint is reconciliation: every fill carries the client
+   * order id WE supplied, so a fill reported against one of our ids for an order
+   * we recorded as cancelled-and-unfilled is a fill we lost — provable per fill,
+   * with no inference about margin or position size. Trades the user placed by
+   * hand carry no client order id of ours and drop out on their own.
+   *
+   * Rate-limited as a history call (`getTradesHistory`), which is the heavy
+   * bucket — this walks account history and must not compete with trading calls
+   * for the account's budget. Futures only: Kraken's spot fills live behind a
+   * different endpoint and are not needed here.
+   *
+   * ⚠️ This endpoint is refused for SOME accounts, not all — do not read a
+   * failure here as "Kraken never lets us read fills".
+   *
+   * A 2026-08-08 measurement saw `/derivatives/api/v3/fills` answer
+   * `{result:'error', error:'authenticationError'}` (HTTP 200) on two unrelated
+   * production accounts, and concluded the keys our users grant simply lack the
+   * query-trades permission. **That conclusion was too strong and is wrong as a
+   * generalisation.** `futures_getAvgFillPrice` calls the same endpoint on the
+   * same credentials from inside this connector, and recorded order history from
+   * before that measurement carries — on many accounts, over a long window — an
+   * average fill price that ONLY that call can produce. So the endpoint does
+   * authenticate, routinely, for the large majority of accounts. The two
+   * failures were a sample, not the population.
+   *
+   * What remains unexplained is why those two refused; a granular per-key
+   * permission is still the most likely reason, it just is not universal. An
+   * executions-history (`api/history/v3/executions`) fallback was written and
+   * removed again: it never once executed, so it was unverified code implying a
+   * working path nobody had proven. Do not re-add one without first proving that
+   * endpoint authenticates.
+   */
+  async getAccountFills(
+    sinceMs?: number,
+    timeProfile = this.getEmptyTimeProfile(),
+  ): Promise<BaseReturn<AccountFill[]>> {
+    if (!this.usdm) {
+      return this.returnGood<AccountFill[]>(timeProfile)([])
+    }
+    if (!this.derivativesClient) {
+      return this.errorClient(timeProfile)
+    }
+
+    timeProfile =
+      (await this.checkLimits('getTradesHistory', undefined, timeProfile)) ||
+      timeProfile
+    timeProfile = this.startProfilerTime(timeProfile, 'exchange')
+
+    return this.derivativesClient
+      .getFills(
+        sinceMs ? { lastFillTime: new Date(sinceMs).toISOString() } : undefined,
+      )
+      .then(async (result) => {
+        timeProfile = this.endProfilerTime(timeProfile, 'exchange')
+        if (result.result !== 'success' || !result.fills) {
+          throw new Error(
+            `Failed to get fills. Result: ${result.result || 'undefined'}`,
+          )
+        }
+        const fills: AccountFill[] = []
+        for (const f of result.fills) {
+          fills.push({
+            fillId: `${f.fill_id}`,
+            orderId: `${f.order_id}`,
+            clientOrderId: f.cliOrdId ?? '',
+            symbol: await this.normalizeSymbol(f.symbol),
+            side: f.side === 'sell' ? 'SELL' : 'BUY',
+            price: `${f.price}`,
+            quantity: `${f.size}`,
+            timestamp: +new Date(f.fillTime),
+            fillType: f.fillType,
+          })
+        }
+        return this.returnGood<AccountFill[]>(timeProfile)(fills)
+      })
+      .catch(
+        this.handleKrakenErrors(
+          this.getAccountFills,
+          sinceMs,
           this.endProfilerTime(timeProfile, 'exchange'),
         ),
       )
@@ -1325,11 +1763,37 @@ class KrakenExchange extends AbstractExchange implements Exchange {
                 'Failed to create order, no order events returned',
             )
           }
+          // Kraken states what this order actually executed at, right here, in
+          // the submit response — and this used to be thrown away in favour of
+          // a re-fetch whose only price source is `getOrderStatus` (limit price
+          // only) plus `futures_getAvgFillPrice`. When that lookup came back
+          // empty the fill was recorded at the order's LIMIT price, which for a
+          // MARKET order means "the price we asked for", erasing all slippage.
+          // These events cost nothing, need no extra permission, and are exact.
+          const placed = this.futures_readExecutionPrice(
+            result.sendStatus.orderEvents,
+          )
           await sleep(500)
-          return await this.getOrder(
+          const fetched = await this.getOrder(
             { symbol, newClientOrderId: orderParams.cliOrdId || '' },
             timeProfile,
           )
+          // Only fill a gap — never overwrite a price the fills endpoint
+          // resolved, and never invent a quantity: if the re-fetch says nothing
+          // executed, believe it and leave the order alone.
+          if (
+            placed.avgPrice &&
+            fetched.status === StatusEnum.ok &&
+            fetched.data &&
+            +fetched.data.executedQty > 0 &&
+            !+(fetched.data.avgPrice || 0)
+          ) {
+            const executedQty = +fetched.data.executedQty
+            fetched.data.avgPrice = `${placed.avgPrice}`
+            fetched.data.price = `${placed.avgPrice}`
+            fetched.data.cummulativeQuoteQty = `${placed.avgPrice * executedQty}`
+          }
+          return fetched
         })
         .catch(
           this.handleKrakenErrors(
@@ -1522,6 +1986,15 @@ class KrakenExchange extends AbstractExchange implements Exchange {
         timeProfile
       timeProfile = this.startProfilerTime(timeProfile, 'exchange')
 
+      // Did the live open-orders view actually ANSWER about this id, as
+      // opposed to the call itself failing? Only the former is evidence the
+      // order is absent, and the staleness check in the history fallback below
+      // is allowed to act on evidence only — a request that did not come back
+      // `success` says nothing about the order and must not be rendered as a
+      // definitive negative (the mistake `isDefinitiveOrderNotFound` exists to
+      // prevent, with money attached).
+      let statusViewAnswered = false
+
       return this.derivativesClient
         .getOrderStatus({
           cliOrdIds: [newClientOrderId],
@@ -1534,10 +2007,26 @@ class KrakenExchange extends AbstractExchange implements Exchange {
             !result.orders ||
             result.orders.length === 0
           ) {
+            statusViewAnswered =
+              result.result === 'success' && Array.isArray(result.orders)
             throw new Error('Order not found in active orders')
           }
 
+          statusViewAnswered = true
+
           const orderInfo = result.orders[0]
+
+          // An element without a status Kraken documents for a real order is
+          // "we do not know this id", not "it is resting". Treat it exactly
+          // like an empty `orders` array and fall through to the history
+          // lookup below. See `futures_isKnownOrderStatus` (bug #366).
+          if (
+            !orderInfo?.order ||
+            !this.futures_isKnownOrderStatus(orderInfo.status)
+          ) {
+            throw new Error('Order not found in active orders')
+          }
+
           const order = orderInfo.order
           const avgFillPrice =
             (order.filled || 0) > 0
@@ -1621,6 +2110,30 @@ class KrakenExchange extends AbstractExchange implements Exchange {
 
                 if (filled > 0) {
                   status = filled >= quantity ? 'FILLED' : 'PARTIALLY_FILLED'
+                } else if (
+                  statusViewAnswered &&
+                  +new Date() - (orderEvent.timestamp || 0) >
+                    KRAKEN_ORDER_PLACED_PROPAGATION_MS
+                ) {
+                  // Bug #408. `OrderPlaced` records that Kraken once accepted
+                  // this order — it is not a snapshot of it. We only get here
+                  // because `getOrderStatus`, the authoritative live view, has
+                  // already said it does not know the id, so an old placement
+                  // with nothing filled is the record of how the phantom was
+                  // born, not evidence it is resting. Reporting NEW is what
+                  // survived the #375 fix: main-app's `_handleUnknownOrder`
+                  // treats a successful read as a resolution and clears its
+                  // `canceledMap` counter, so the 5-attempt force-cancel that
+                  // exists for exactly this case is never reached and the row
+                  // sits at NEW forever (7 cancels/18h on `GRID-RO-9BQqa08…`).
+                  //
+                  // Surfaced as a definitive not-found so `main-app`'s
+                  // `isDefinitiveOrderNotFound` matches and the counter can
+                  // finally saturate. Deliberately narrow: fills above are real
+                  // evidence at any age, a terminal cancel/reject is handled
+                  // above, and only a placement younger than the propagation
+                  // floor is still trusted — see that constant.
+                  throw new Error('Order not found in history')
                 }
               }
 
@@ -1856,7 +2369,7 @@ class KrakenExchange extends AbstractExchange implements Exchange {
         .cancelOrder({
           order_id: orderId,
         })
-        .then((result) => {
+        .then(async (result) => {
           timeProfile = this.endProfilerTime(timeProfile, 'exchange')
 
           if (result.result !== 'success') {
@@ -1865,14 +2378,42 @@ class KrakenExchange extends AbstractExchange implements Exchange {
             )
           }
 
+          const outcome = this.futures_readCancelOutcome(result.cancelStatus)
+
+          if (outcome.unknown) {
+            // Hand the caller its unknown-order path, which re-fetches and
+            // reconciles, rather than asserting a cancel we did not observe.
+            throw new Error(`Unknown order ${orderId}`)
+          }
+
+          // Only reach for the account fills when the events carried no price.
+          const avgPrice =
+            outcome.avgPrice ||
+            (outcome.executedQty > 0
+              ? ((await this.futures_getAvgFillPrice(
+                  orderId,
+                  outcome.clientOrderId || undefined,
+                )) ?? undefined)
+              : undefined)
+
           return this.returnGood<CommonOrder>(timeProfile)(
             this.futures_convertOrder({
               orderId,
-              symbol,
-              clientOrderId: '',
-              status: 'CANCELED',
-              type: 'LIMIT',
-              side: 'BUY',
+              symbol: outcome.symbol
+                ? await this.normalizeSymbol(outcome.symbol)
+                : symbol,
+              clientOrderId: outcome.clientOrderId,
+              price: outcome.limitPrice,
+              avgPrice,
+              origQty: outcome.origQty,
+              executedQty: outcome.executedQty,
+              status: this.futures_deriveOrderStatus(
+                outcome.rawStatus,
+                outcome.executedQty,
+                outcome.origQty,
+              ),
+              type: outcome.type,
+              side: outcome.side,
             }),
           )
         })
@@ -2531,6 +3072,172 @@ class KrakenExchange extends AbstractExchange implements Exchange {
       )
   }
 
+  /**
+   * What this account actually pays, from the PRIVATE `TradeVolume` endpoint.
+   *
+   * Best-effort by design. Every failure path returns "unknown" rather than an
+   * error, and the caller then falls back to the published ladder's first rung
+   * — i.e. exactly the behaviour that shipped before this existed. That matters
+   * for more than tidiness: main-app's hourly fee sweep treats a hard failure
+   * from `getAllUserFees` as evidence the API key is dead and counts it toward
+   * disabling the key (`feeAuthFailures` / `feeAuthDisabled` in
+   * `src/user/utils.ts`). Letting a TradeVolume hiccup surface as a failed fee
+   * fetch would start switching off working Kraken keys.
+   *
+   * Pair-scoped, and authoritative: Kraken answers with the rate this account
+   * actually pays on this pair — volume tier or negotiated alike — so no
+   * client-side tier arithmetic is involved. The bulk sweep's counterpart is
+   * `getAccountPairFees`, which batches the whole pair list the same way.
+   */
+  private async getAccountFees(
+    krakenSymbol: string,
+  ): Promise<KrakenAccountFees> {
+    // No credentials — the keyless public client (cron pair sync, unauthenticated
+    // callers) can never answer this, and must not pay for finding that out.
+    if (!this.spotClient || !this.key || !this.secret) {
+      return KRAKEN_ACCOUNT_FEES_UNKNOWN
+    }
+
+    const cacheKey = `${hashKrakenKey(this.key)}:${krakenSymbol ?? '*'}`
+    const cached = krakenTradeVolumeCache.get(cacheKey)
+    if (cached && Date.now() - cached.ts < KRAKEN_TRADE_VOLUME_TTL) {
+      return { taker: cached.taker, maker: cached.maker }
+    }
+
+    try {
+      await this.checkLimits('getTradingVolume', krakenSymbol)
+      const res = await this.spotClient.getTradingVolume(
+        krakenSymbol ? { pair: krakenSymbol } : {},
+      )
+      if (!res.result || res.error?.length) {
+        throw new Error(res.error?.[0] || 'Failed to get trade volume')
+      }
+
+      // Kraken echoes the pair back under its own name, which is not always the
+      // string we asked with. Prefer an exact match, then fall back to the sole
+      // entry — a pair-scoped call only ever describes one pair.
+      const pick = (
+        map: Record<string, { fee: string }> | undefined,
+      ): number | null => {
+        if (!map || !krakenSymbol) {
+          return null
+        }
+        const entry =
+          map[krakenSymbol] ??
+          (Object.keys(map).length === 1 ? map[Object.keys(map)[0]] : undefined)
+        const percent = Number(entry?.fee)
+        return Number.isFinite(percent) ? percent / 100 : null
+      }
+
+      const fees: KrakenAccountFees = {
+        taker: pick(res.result.fees),
+        maker: pick(res.result.fees_maker),
+      }
+      krakenTradeVolumeCache.set(cacheKey, { ...fees, ts: Date.now() })
+      return fees
+    } catch (error) {
+      // Cache the miss too, so a key without the permission (or an account
+      // Kraken refuses this endpoint for) does not re-ask on every pair of
+      // every sweep. It re-probes once the TTL lapses.
+      krakenTradeVolumeCache.set(cacheKey, {
+        ...KRAKEN_ACCOUNT_FEES_UNKNOWN,
+        ts: Date.now(),
+      })
+      Logger.warn(
+        // The SDK wraps a Kraken-level rejection (HTTP 200 + non-empty
+        // `error`) as `{code: 200, message: statusText, body: response.data}`
+        // — so `.message` is literally "OK" and the REAL reason ("EGeneral:
+        // Permission denied", "EAPI:Invalid key", …) lives in `body.error`.
+        // Logging `.message` made the first day of this fallback undiagnosable.
+        `Kraken trade volume lookup failed, falling back to the published fee ladder: ${
+          (error as { body?: { error?: string[] } })?.body?.error?.join('; ') ||
+          (error?.message && error.message !== 'OK'
+            ? error.message
+            : safeStringify(error).slice(0, 200))
+        }`,
+      )
+      return KRAKEN_ACCOUNT_FEES_UNKNOWN
+    }
+  }
+
+  /**
+   * The account's ACTUAL rate for each requested pair, from pair-scoped
+   * `TradeVolume` calls in chunks. This is the only way Kraken exposes what
+   * an account actually pays (see `krakenPairFeeMapCache`); the published
+   * ladder's first rung is the fallback for any pair this cannot answer.
+   *
+   * Same best-effort contract as `getAccountFees`: every failure degrades to
+   * an empty (or partial) map, never an error — a TradeVolume problem must not
+   * surface as a failed fee fetch (main-app's sweep counts those toward
+   * disabling the key). A failed chunk is skipped, not fatal: chunks are
+   * independent, and one bad pair name must not cost the other 650 pairs
+   * their real rate. Tokenized (xStock) pairs are deliberately NOT batched —
+   * they live in a different asset class that TradeVolume may refuse, and
+   * refusing a chunk of 50 over one of them is the poisoning this avoids.
+   */
+  private async getAccountPairFees(
+    krakenPairs: string[],
+  ): Promise<Map<string, { taker: number | null; maker: number | null }>> {
+    const out = new Map<
+      string,
+      { taker: number | null; maker: number | null }
+    >()
+    if (!this.spotClient || !this.key || !this.secret || !krakenPairs.length) {
+      return out
+    }
+
+    const cacheKey = `${hashKrakenKey(this.key)}:pairmap`
+    const cached = krakenPairFeeMapCache.get(cacheKey)
+    if (cached && Date.now() - cached.ts < KRAKEN_TRADE_VOLUME_TTL) {
+      return cached.map
+    }
+
+    let failures = 0
+    for (let i = 0; i < krakenPairs.length; i += KRAKEN_TRADE_VOLUME_CHUNK) {
+      const chunk = krakenPairs.slice(i, i + KRAKEN_TRADE_VOLUME_CHUNK)
+      try {
+        await this.checkLimits('getTradingVolume')
+        const res = await this.spotClient.getTradingVolume({
+          pair: chunk.join(','),
+        })
+        if (!res.result) {
+          failures++
+          continue
+        }
+        const takers = res.result.fees ?? {}
+        const makers = res.result.fees_maker ?? {}
+        for (const p of chunk) {
+          const t = Number(takers[p]?.fee)
+          const m = Number(makers[p]?.fee)
+          if (Number.isFinite(t) || Number.isFinite(m)) {
+            out.set(p, {
+              taker: Number.isFinite(t) ? t / 100 : null,
+              maker: Number.isFinite(m) ? m / 100 : null,
+            })
+          }
+        }
+      } catch (error) {
+        failures++
+        if (failures === 1) {
+          Logger.warn(
+            `Kraken pair-scoped trade volume failed (chunk ${i / KRAKEN_TRADE_VOLUME_CHUNK + 1}), affected pairs fall back to the ladder: ${
+              (error as { body?: { error?: string[] } })?.body?.error?.join(
+                '; ',
+              ) ||
+              (error?.message && error.message !== 'OK'
+                ? error.message
+                : safeStringify(error).slice(0, 200))
+            }`,
+          )
+        }
+      }
+    }
+    // Cache partial and even empty results: a key that cannot answer (missing
+    // permission) must not re-ask 14 times per pair-sweep every 10 minutes.
+    krakenPairFeeMapCache.set(cacheKey, { map: out, ts: Date.now() })
+    return out
+  }
+
   async getUserFees(
     symbol: string,
     timeProfile = this.getEmptyTimeProfile(),
@@ -2564,7 +3271,7 @@ class KrakenExchange extends AbstractExchange implements Exchange {
           ? { aclass: 'tokenized_asset' }
           : {}),
       } as Parameters<typeof this.spotClient.getAssetPairs>[0])
-      .then((result) => {
+      .then(async (result) => {
         timeProfile = this.endProfilerTime(timeProfile, 'exchange')
 
         if (!result.result || result.error?.length) {
@@ -2576,20 +3283,18 @@ class KrakenExchange extends AbstractExchange implements Exchange {
           throw new Error(`Pair ${symbol} not found`)
         }
 
-        // Extract fees from first tier (highest fee for lowest volume)
-        // fees format: [[volume, percent], ...] e.g., [[0, 0.26], [50000, 0.24], ...]
-        const takerFee =
-          pairInfo.fees && pairInfo.fees.length > 0
-            ? parseFloat(pairInfo.fees[0][1] as any) / 100
-            : 0.0026
-        const makerFee =
-          pairInfo.fees_maker && pairInfo.fees_maker.length > 0
-            ? parseFloat(pairInfo.fees_maker[0][1] as any) / 100
-            : 0.0016
+        // `AssetPairs` publishes the whole tier ladder — `[[volume, percent], …]`
+        // e.g. [[0, 0.40], [50000, 0.35], …] — but says nothing about WHICH rung
+        // this account is on. Reading `fees[0]` therefore charged every user the
+        // lowest-volume tier. Ask the account's own schedule and use that; the
+        // ladder's first rung is now only the answer for a caller we cannot
+        // identify.
+        const account = await this.getAccountFees(krakenSymbol)
 
         const fee: UserFee = {
-          maker: makerFee,
-          taker: takerFee,
+          taker: account.taker ?? krakenLadderFee(pairInfo.fees, null, 0.26),
+          maker:
+            account.maker ?? krakenLadderFee(pairInfo.fees_maker, null, 0.16),
         }
 
         return this.returnGood<UserFee>(timeProfile)(fee)
@@ -2666,19 +3371,28 @@ class KrakenExchange extends AbstractExchange implements Exchange {
           }
         }
 
+        // The account's ACTUAL per-pair rates, straight from Kraken. The
+        // pair-scoped TradeVolume batch is authoritative for both volume-tier
+        // and negotiated rates — Kraken does the tier arithmetic, not us. Any
+        // pair the batch could not answer (tokenized pairs, a failed chunk,
+        // no credentials) falls back to the published ladder's FIRST rung,
+        // which is byte-for-byte the pre-1.20.3 behaviour. Deliberately no
+        // client-side ladder-by-volume interpolation: it duplicated arithmetic
+        // Kraken already performs, and could only ever fire in the narrow case
+        // where a chunk failed but a pairless call worked.
+        const pairFees = await this.getAccountPairFees(
+          Object.keys(result.result),
+        )
+
         const fees: (UserFee & { pair: string })[] = Object.entries({
           ...result.result,
           ...tokenizedPairs,
-        }).map(([_, pairInfo]) => {
-          // Extract fees from first tier (highest fee for lowest volume)
+        }).map(([pairKey, pairInfo]) => {
+          const exact = pairFees.get(pairKey)
           const takerFee =
-            pairInfo.fees && pairInfo.fees.length > 0
-              ? parseFloat(pairInfo.fees[0][1] as any) / 100
-              : 0.0026
+            exact?.taker ?? krakenLadderFee(pairInfo.fees, null, 0.26)
           const makerFee =
-            pairInfo.fees_maker && pairInfo.fees_maker.length > 0
-              ? parseFloat(pairInfo.fees_maker[0][1] as any) / 100
-              : 0.0016
+            exact?.maker ?? krakenLadderFee(pairInfo.fees_maker, null, 0.16)
           const base = this.symbolMapper.getActualAssetName(pairInfo.base || '')
           const quote = this.symbolMapper.getActualAssetName(
             pairInfo.quote || '',
@@ -2778,15 +3492,7 @@ class KrakenExchange extends AbstractExchange implements Exchange {
       .getCandles({
         pair: await this.toKrakenSymbol(symbol),
         interval: intervalMinutes as
-          | 1
-          | 5
-          | 15
-          | 30
-          | 60
-          | 240
-          | 1440
-          | 10080
-          | 21600,
+          1 | 5 | 15 | 30 | 60 | 240 | 1440 | 10080 | 21600,
         since: from ? Math.floor(from / 1000) : undefined,
         ...this.xstockParams(symbol),
       })
@@ -3226,6 +3932,54 @@ class KrakenExchange extends AbstractExchange implements Exchange {
     return this.returnGood<LeverageBracket[]>(timeProfile)(brackets)
   }
 
+  /**
+   * The account's leverage preferences, keyed by upper-cased Kraken symbol.
+   *
+   * `GET /derivatives/api/v3/leveragepreferences` lists only contracts with an
+   * isolated preference set (`maxLeverage`); anything absent is cross. A
+   * failure returns `null` so callers can tell "unknown" from "cross" — the
+   * two are not the same thing and only one of them is safe to assert.
+   * Read-only; never written into `krakenLeveragePrefCache`, whose contract is
+   * "last state WE confirmed by writing".
+   */
+  private async futures_readLeveragePrefs(timeProfile: TimeProfile): Promise<{
+    prefs: Map<string, KrakenLeveragePref> | null
+    timeProfile: TimeProfile
+  }> {
+    if (!this.derivativesClient) {
+      return { prefs: null, timeProfile }
+    }
+    timeProfile =
+      (await this.checkLimits(
+        'getLeveragePreferences',
+        undefined,
+        timeProfile,
+      )) || timeProfile
+    timeProfile = this.startProfilerTime(timeProfile, 'exchange')
+    try {
+      const result = await this.derivativesClient.getLeverageSettings()
+      timeProfile = this.endProfilerTime(timeProfile, 'exchange')
+      if (result.result !== 'success') {
+        return { prefs: null, timeProfile }
+      }
+      const prefs = new Map<string, KrakenLeveragePref>()
+      for (const p of result.leveragePreferences ?? []) {
+        const max = +(p.maxLeverage ?? 0)
+        prefs.set(
+          `${p.symbol ?? ''}`.toUpperCase(),
+          Number.isFinite(max) && max > 0 ? max : 'cross',
+        )
+      }
+      return { prefs, timeProfile }
+    } catch (e) {
+      timeProfile = this.endProfilerTime(timeProfile, 'exchange')
+      Logger.warn(
+        `Kraken leverage preferences unavailable, positions will not carry a leverage: ${safeStringify(e).slice(0, 200)}`,
+      )
+      return { prefs: null, timeProfile }
+    }
+  }
+
   async futures_getPositions(
     symbol?: string,
     timeProfile = this.getEmptyTimeProfile(),
@@ -3262,6 +4016,15 @@ class KrakenExchange extends AbstractExchange implements Exchange {
           positions = positions.filter((p) => p.symbol === krakenSymbol)
         }
 
+        // One read covers every contract on the account; skip it when there
+        // is nothing to label.
+        let prefs: Map<string, KrakenLeveragePref> | null = null
+        if (positions.length > 0) {
+          const read = await this.futures_readLeveragePrefs(timeProfile)
+          prefs = read.prefs
+          timeProfile = read.timeProfile
+        }
+
         const positionInfos: PositionInfo[] = []
         for (const pos of positions) {
           positionInfos.push(
@@ -3271,6 +4034,12 @@ class KrakenExchange extends AbstractExchange implements Exchange {
               size: pos.size,
               price: pos.price,
               unrealizedFunding: pos.unrealizedFunding,
+              // No entry in the preference list = no isolated preference =
+              // cross. A failed read is `undefined` — unknown, not cross.
+              leveragePref:
+                prefs === null
+                  ? undefined
+                  : (prefs.get(`${pos.symbol ?? ''}`.toUpperCase()) ?? 'cross'),
             }),
           )
         }

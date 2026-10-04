@@ -2,6 +2,8 @@ import {
   AccountFill,
   AllPricesResponse,
   BaseReturn,
+  BatchOpenOrder,
+  BatchOpenResult,
   CandleResponse,
   FundingRateResponse,
   CommonOrder,
@@ -205,6 +207,66 @@ export class ExchangeService {
     ).getOrder({ symbol: data.symbol, newClientOrderId: data.newClientOrderId })
   }
 
+  getOrdersBatch(
+    data: { symbol: string; newClientOrderIds: string[] },
+    auth: AuthData,
+  ): Promise<BaseReturn<CommonOrder[]>> {
+    return this.getExchange(
+      auth.exchange,
+      auth.key,
+      auth.secret,
+      auth.passphrase,
+      auth.keystype,
+      auth.okxsource,
+      auth.code,
+      auth.bybithost,
+      auth.subaccount,
+    ).getOrdersBatch({
+      symbol: data.symbol,
+      newClientOrderIds: data.newClientOrderIds ?? [],
+    })
+  }
+
+  cancelOrdersBatch(
+    data: { symbol: string; newClientOrderIds: string[] },
+    auth: AuthData,
+  ): Promise<BaseReturn<CommonOrder[]>> {
+    return this.getExchange(
+      auth.exchange,
+      auth.key,
+      auth.secret,
+      auth.passphrase,
+      auth.keystype,
+      auth.okxsource,
+      auth.code,
+      auth.bybithost,
+      auth.subaccount,
+    ).cancelOrdersBatch({
+      symbol: data.symbol,
+      newClientOrderIds: data.newClientOrderIds ?? [],
+    })
+  }
+
+  openOrdersBatch(
+    data: { symbol: string; orders: BatchOpenOrder[] },
+    auth: AuthData,
+  ): Promise<BaseReturn<BatchOpenResult[]>> {
+    return this.getExchange(
+      auth.exchange,
+      auth.key,
+      auth.secret,
+      auth.passphrase,
+      auth.keystype,
+      auth.okxsource,
+      auth.code,
+      auth.bybithost,
+      auth.subaccount,
+    ).openOrdersBatch({
+      symbol: data.symbol,
+      orders: data.orders ?? [],
+    })
+  }
+
   getAllOpenOrders(
     data: { symbol?: string; returnOrders: boolean },
     auth: AuthData,
@@ -295,6 +357,20 @@ export class ExchangeService {
       auth.bybithost,
       auth.subaccount,
     ).getMarginAvailableUsd()
+  }
+
+  getSharedWallet(auth: AuthData): Promise<BaseReturn<boolean | null>> {
+    return this.getExchange(
+      auth.exchange,
+      auth.key,
+      auth.secret,
+      auth.passphrase,
+      auth.keystype,
+      auth.okxsource,
+      auth.code,
+      auth.bybithost,
+      auth.subaccount,
+    ).getSharedWallet()
   }
 
   getAccountFills(

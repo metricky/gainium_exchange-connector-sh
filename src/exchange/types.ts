@@ -1,11 +1,5 @@
 export type AssetClass =
-  | 'crypto'
-  | 'stock'
-  | 'etf'
-  | 'commodity'
-  | 'metal'
-  | 'forex'
-  | 'index'
+  'crypto' | 'stock' | 'etf' | 'commodity' | 'metal' | 'forex' | 'index'
 
 export type ExchangeInfo = {
   wsCode?: string
@@ -35,6 +29,11 @@ export type ExchangeInfo = {
   // canonical. The dashboard's "Canonical only" pair-picker toggle filters on
   // `=== false` so non-HL exchanges are unaffected.
   isCanonical?: boolean
+  // Clean equity ticker behind a tokenized-stock market (`AAPL` for Bitget's
+  // `rAAPL`), set only where the exchange itself marks the market as a wrapper
+  // (Bitget v3 `isReality`). Consumers use it for logo/name lookup instead of
+  // guessing from the symbol's shape. Absent => the base name is the ticker.
+  underlying?: string
   priceMultiplier?: {
     up: number
     down: number
@@ -318,7 +317,28 @@ type Asset = {
 export type FreeAsset = Asset[]
 
 export type FuturesFreeAsset = Omit<Asset, 'locked'>[]
-export type UserFee = { maker: number; taker: number }
+export type UserFee = {
+  maker: number
+  taker: number
+  /**
+   * Where this rate came from. `venue` = the exchange told us what THIS
+   * account pays. `ladder` = we could not ask, so this is the published
+   * schedule's entry rung — a guess that is wrong for anyone not on the
+   * bottom tier, and on Kraken is currently stale enough to match no real
+   * tier at all (its first rung reads 0.40%/0.25%; Kraken's live Tier 1 is
+   * 0.80%/0.40%).
+   *
+   * It exists so the CALLER can name the account: the connector receives only
+   * credentials (`AuthData` has no userId or uuid), so it can never say whose
+   * lookup degraded — but main-app's fee sweep knows exactly which user and
+   * connection it is asking for, and can log it the moment it sees `ladder`.
+   * Without this the fallback is invisible: it returns a plausible number,
+   * `status` is OK, and the stale rate is silently written to the user's fees.
+   *
+   * Optional and additive — absent means "not reported", never "venue".
+   */
+  source?: 'venue' | 'ladder'
+}
 export type OrderStatusType = 'CANCELED' | 'FILLED' | 'NEW' | 'PARTIALLY_FILLED'
 
 export type OrderTypeT = 'LIMIT' | 'MARKET'
@@ -348,6 +368,10 @@ export type CommonOrder = {
   status: OrderStatusType
   type: OrderTypeT
   side: OrderSideType
+  // Something the user should know about an order the venue ACCEPTED, e.g. a
+  // Bitget Reality token with nobody on the other side of the book right now.
+  // Never a refusal: those are the call's `reason`.
+  notice?: string
   fills?: {
     price: string
     qty: string
@@ -355,6 +379,92 @@ export type CommonOrder = {
     commissionAsset: string
     tradeId: string
   }[]
+  /**
+   * The fee the VENUE actually charged for this order, as the venue reports
+   * it — never a rate we applied ourselves.
+   *
+   * This exists because `deal.commission` has always been an ESTIMATE
+   * (`qty * price * storedFeeRate`), and an estimate is only ever as good as
+   * the stored rate. That assumption does not hold: Kraken accounts are
+   * routinely found carrying a rate matching no tier in Kraken's live schedule
+   * (the public ladder we fall back to is stale — its first rung, 0.40%/0.25%,
+   * is not a real tier; Kraken's actual Tier 1 is 0.80%/0.40%), so the
+   * "commission" booked against those deals can be about half the true cost. An
+   * observed fee cannot go stale the way a cached rate can.
+   *
+   * Optional and additive on purpose: `CommonOrder` is the platform's most
+   * load-bearing contract (root CLAUDE.md Danger List #1). A venue that does
+   * not report a fee simply omits it, and callers keep their existing
+   * estimate — a missing fee must never book as zero cost.
+   */
+  feePaid?: string
+  /**
+   * WHICH side of the pair the fee came out of. Not derivable in general and
+   * never to be assumed: Kraken charges quote on a buy and base on a sell (its
+   * `oflags` default `fciq`/`fcib`), Binance-shaped venues normally take it
+   * from the asset received, and some accounts pay in a third asset entirely.
+   * Maps directly onto main-app's `deal.feePaid.{base,quote}` without any
+   * symbol string-splitting.
+   */
+  feeSide?: 'base' | 'quote'
+  /**
+   * The fee asset's TICKER, as the venue named it. Most venues answer the
+   * currency question this way rather than by naming a side, and the ticker
+   * may be neither side of the pair (BNB on Binance, BGB on Bitget, KCS on
+   * KuCoin). Resolving it against the pair is the consumer's job — it is the
+   * side that knows the order's `baseAsset`/`quoteAsset`. When set, `feeSide`
+   * is absent.
+   */
+  feeAsset?: string
+  /**
+   * Set INSTEAD of `feePaid`/`feeAsset` when a single order's fee was charged
+   * in more than one currency — a partial BNB/BGB deduction that covers some
+   * of the fee and leaves the rest in the quote asset.
+   *
+   * The legs are deliberately not summed: they are different currencies, and
+   * adding them would mean inventing an FX rate here, which is the same class
+   * of assumption that made the stored fee rate untrustworthy in the first
+   * place. `feePaid` is left unset in this case so that a consumer reading
+   * only `feePaid` cannot mistake one leg for the whole cost.
+   */
+  feeBreakdown?: { asset: string; amount: string }[]
+}
+
+/**
+ * One order in a bulk placement request. LIMIT only, and `newClientOrderId` is
+ * REQUIRED — it is how the caller matches an answer back to the order it asked
+ * for, and a venue reply that only says "order 3 failed" is useless without it.
+ */
+export type BatchOpenOrder = {
+  side: OrderTypes
+  quantity: number
+  price: number
+  newClientOrderId: string
+  type?: OrderTypeT
+}
+
+/**
+ * The answer for ONE order of a bulk placement, positionally aligned with the
+ * request and carrying the caller's own `newClientOrderId` so alignment is
+ * never the only thing holding the two together.
+ *
+ * Exactly one of `order` / `reason` is set:
+ *
+ * - `order` — placed. A REAL order (re-read from the venue, or built from what
+ *   was sent plus the id the venue issued), never synthesised zeros.
+ * - `reason` — THIS order was definitively refused by the venue, in the
+ *   venue's own words. A whole-batch failure is a `notok` `BaseReturn`
+ *   instead, so the caller can tell "none of these were placed" from "this one
+ *   was rejected".
+ *
+ * An order that was placed must never be reported as absent: the caller's
+ * recovery for an unanswered order is to place it again, which on a
+ * successfully placed order is a duplicate live order.
+ */
+export type BatchOpenResult = {
+  newClientOrderId: string
+  order?: CommonOrder
+  reason?: string
 }
 
 export type FuturesOrderType_LT =

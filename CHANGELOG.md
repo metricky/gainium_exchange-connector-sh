@@ -5,6 +5,389 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.27.3] - 2026-10-03
+
+### Fixed
+
+- **OKX X-Perp orders were sometimes rejected as "Instrument ID ... doesn't exist".** A bot's order on an OKX Europe X-Perp (stock, commodity and crypto `*-USD_UM_XPERP` pairs) must carry the instrument's live ID with its expiry tag. The connector looked that ID up from OKX's public instrument list, held per request, so every order, cancel and order lookup downloaded the whole list again. When that call failed (several bots placing orders at the same moment can trip its rate limit) the failure was ignored and the order went out under the bare pair name, which OKX rejects. The list is now cached once per process and refreshed by a single shared request. Order, cancel and lookup also name the pair they need, so a pair missing from the cache is refetched, and accounts not on OKX Europe resolve X-Perp pairs as well. When OKX does return this error, the ID that was sent is logged and the cache is refreshed on the next call.
+
+## [1.27.2] - 2026-10-01
+
+### Added
+
+- Kraken: one `Kraken broker | <path> | <symbol> | <order ids>` log line per order accepted with the API Partner ID.
+
+## [1.27.1] - 2026-10-01
+
+### Added
+
+- Kraken: orders (spot single and batch, futures) carry the API Partner ID passed as the broker code in the `broker` field. A missing or malformed code sends no `broker`, so placement never depends on it.
+
+## [1.27.0] - 2026-09-27
+
+### Added
+
+- `GET /sharedWallet`: whether a key's spot and futures legs share one wallet (Hyperliquid unified / portfolio-margin, Bitget Unified Trading Account), so callers can store that wallet once instead of once per leg. `null` when undetermined.
+
+## [1.26.3] - 2026-09-26
+
+### Fixed
+
+- **Hyperliquid perpetuals show the balance of Unified Account and Portfolio Margin accounts.** In these account modes Hyperliquid keeps all collateral, including what backs perpetual positions, in the spot ledger, and reports the perpetuals account as empty. The perpetuals balance was read only from that perpetuals account, so a funded account showed zero and bots could not start. The connector now checks the account mode and, for these two modes, reads the perpetuals collateral (USDC and each builder dex's quote token) from the spot ledger, with amounts reserved by margin and open orders shown as locked. Standard accounts are unchanged.
+
+## [1.26.2] - 2026-09-25
+
+### Fixed
+
+- **A KuCoin order refused on every attempt is reported as a refusal, not as an unknown outcome.** Some definitive KuCoin answers, such as insufficient balance, are retried on purpose. Once those retries ran out, the error was returned with the prefix that means the connection itself failed, so callers treated a plain refusal as an order that might have been placed: they asked about it and sent it again, and kept it on record as if it could be resting. The prefix is now added only when at least one attempt failed in a way that could have reached the exchange.
+
+## [1.26.1] - 2026-09-24
+
+### Added
+
+- An order on a Bitget Reality stock token that the exchange accepts while nobody is on the other side of its book now comes back with a `notice` explaining that it will wait for liquidity. Bitget keeps these tokens listed and their price moving around the clock, but for many of them there are no resting orders outside US market hours, so an order placed then is accepted and simply waits. The order is never refused or delayed by the check, and an order on a pair with liquidity carries no notice.
+
+## [1.26.0] - 2026-09-24
+
+### Added
+
+- OKX reports pooled collateral for futures connections on a Multi-currency or Portfolio margin account (`/marginAvailableUsd` = adjusted equity minus initial margin in use, in USD), so an account holding EUR or coins but no USDC can size and open USDC-quoted contracts such as the OKX Europe X-Perps. Other account modes answer `null` and keep the per-coin rule.
+- OKX pairs carry an asset class from OKX's own instrument category: equities (including equity ETFs, which OKX does not tell apart) are `stock`, metals and energy are `commodity`; everything else keeps the crypto default. Contributed by a community member.
+
+## [1.25.4] - 2026-09-24
+
+### Fixed
+
+- Bitget fee refreshes stop at the first refusal that belongs to the API key rather than to a pair (IP not on the key's allow-list, key deleted, wrong secret, missing permissions, restricted account), and return that refusal as the call's result. The spot and futures fee readers ask for each listed pair separately, and previously logged such a refusal once per pair and carried on through the whole listing, although no pair could succeed with that key. Refusals about a single pair, such as a delisted symbol, still fall back to the listed rate for that pair only.
+
+## [1.25.3] - 2026-09-24
+
+### Fixed
+
+- The Basic-mode refusal message now states Bitget's conditions for Advanced mode — at least 1,000 USD of account equity and no open orders, positions or debts — so a smaller account is not sent looking for a setting Bitget does not offer it.
+
+## [1.25.2] - 2026-09-24
+
+### Fixed
+
+- An order Bitget refuses because the Unified Trading Account is in Basic mode now says what to do. Unified accounts start in Basic mode, which does not support coin-margined (inverse) futures or cross margin, and the venue answers such an order with "the data is not exist" and "basemode not supported", which named nothing a user could act on. The refusal now reads that the account must be switched to Advanced mode on Bitget.
+
+## [1.25.1] - 2026-09-24
+
+### Fixed
+
+- Bitget returns monthly candles on every market — spot, USDT-M and inverse — where a monthly request previously succeeded with no bars. Monthly is not one of the connector's fixed-width intervals, and each Bitget reader sized its pages by bar width, so a month's page came out with no size at all. Months are now read as UTC calendar months (the same anchor Binance uses) by their own short path: spot in one request, since the venue returns every month a pair has traded; USDT-M and USDC-M from the history endpoint, which serves closed months, plus the recent endpoint for the month still forming; inverse perpetuals walking back from the requested end in windows inside the venue's 90-day limit until the first empty page before the listing. The result is cut to the requested range, starting from the month containing its start.
+
+## [1.25.0] - 2026-09-24
+
+### Added
+
+- Bitget Reality stock tokens carry the ticker of the stock they track in a new optional `underlying` field on exchange info (`AAPL` for `rAAPL`, `T` for `rT`). It is set only for markets Bitget itself flags as Reality tokens, so consumers can look up a logo or company name without inferring the ticker from the shape of the symbol. Bitget's stock perpetuals already use the plain ticker and carry no `underlying`.
+
+## [1.24.1] - 2026-09-24
+
+### Fixed
+
+- Bitget inverse (coin-margined) perpetuals return candle history at 4-hour, daily and weekly bars over long ranges. Their candles come from the venue's unified-account market endpoint, which, like the classic futures one, refuses any window wider than about 90 days — but the reader sized each page by bar count alone (1000 bars), so every page at 4 hours and wider was refused. Weekly charts came back empty, and a daily range could not be read or back-filled beyond the few days already stored. Pages are now bounded by the 90-day window as well, the reader walks the whole requested range instead of stopping at the first short page (a window-limited page is short by design, and so is every page before a pair's listing), and bars repeated across a page boundary are removed.
+
+## [1.24.0] - 2026-09-24
+
+### Added
+
+- Bitget Unified Trading Accounts in multi-assets mode report their pooled margin. In that mode every coin in the wallet margins every contract, inverse ones included, so an account holding only USDT can open an inverse (coin-margined) perpetual — but the platform still expected such a contract to be funded in its own coin and refused the order before it reached the venue. The connector now answers the pooled-margin request for these accounts with the USD still available to new positions (effective equity less the initial margin already required), which lets the platform check an inverse order against the whole wallet. Single-asset and isolated-level unified accounts, classic accounts and spot are unchanged and still answer that they have no pool.
+
+## [1.23.4] - 2026-09-24
+
+### Fixed
+
+- An inverse perpetual's filled quantity is read correctly on contracts priced under a dollar. The venue reports a filled order's traded quantity and traded value as the same figure — both in contracts — and the connector inferred the unit from which currency the two agreed in. Above a dollar that inference happened to land on the right answer; below one it read the contracts as the coin itself, reporting a fill at a fraction of its real size. The venue's behaviour on live fills is now the rule.
+
+## [1.23.3] - 2026-09-23
+
+### Fixed
+
+- Bitget candle history no longer loses a bar at every page boundary. A range wider than one venue page is read in several requests, and each request started one bar after the previous one ended — but none of Bitget's three candle endpoints ends its window where that assumed. The futures history endpoint and the spot history endpoint both stop one bar short of the requested end, and the recent spot endpoint starts one bar after the requested start, so a bar fell between every pair of consecutive pages, and two fell across the single point in a long spot range where the reader switches from the history endpoint to the recent one. Nothing reported a fault: the read succeeded and the series looked plausible, so a chart, a backtest, an indicator warm-up or an archive backfill over a long range was quietly computed on an incomplete series. At the bar widths that are read at a finer width and merged — 8-hour everywhere, and 2-hour, 3-minute and weekly on spot — there was no gap to notice at all, because a bar missing from the finer series does not leave a hole in the merged one, it silently changes that merged bar's open, high, low, close and volume. The damage grew with the number of boundaries a range crossed, so it was largest at the daily and weekly widths, whose pages are the narrowest relative to the range. Each page now begins where the previous one ended, which for the futures reader cannot double-count because its window excludes its own end, and for the spot reader overlaps by at most two bars, which the existing de-duplication already removes. The deliberate reach past the requested end that carries the in-progress candle is unchanged, as are the page-size limits and the merging of widths the venue does not serve natively.
+
+## [1.23.2] - 2026-09-23
+
+### Fixed
+
+- Bitget futures candles are returned at daily and weekly bars over ranges longer than about three months, where the request previously came back empty. Bitget's futures candle history limits a request two ways — at most 200 bars, and a window no wider than about 90 days whatever the bar size — and the reader sized each page by bar count alone. Two hundred bars is inside 90 days at every width up to 4 hours, so those were unaffected; at daily bars a page asked for 200 days and at weekly bars for 1400 days, so every page was refused and the whole read failed with the venue's parameter error, reaching a chart or a backtest as an absence of history rather than as a fault. A page is now bounded by whichever of the two limits binds first, with the 90-day figure recorded as a measured constant, and the reader walks the requested range to its end instead of counting pages in bars — a span-limited page carries fewer bars than that arithmetic assumed, so counting them would have truncated the series silently instead. Ranges still reach as far back as the venue serves; no floor on the start of a range is reintroduced, and widths of 8 hours and below are untouched.
+
+## [1.23.1] - 2026-09-22
+
+### Fixed
+
+- Bitget candles are returned at the bar width that was asked for. Three widths were quietly answered with a different one: a request for 8-hour bars came back as 6-hour bars on every Bitget product line, and on spot and USDT/USDC futures a request for 2-hour bars came back as 1-hour bars and 3-minute bars as 1-minute bars. Each was answered successfully, carrying the venue's own timestamps, so an 8-hour series was not even aligned to 8 hours and nothing downstream could tell it was the wrong series — an indicator or a backtest configured at one timeframe was calculated on another. Bitget serves 3-minute bars natively on all three lines and 2-hour bars natively on the two futures lines, so those are now requested directly; the two widths it has no granularity for at all (8-hour everywhere, 2-hour on spot) are read at the nearest finer width it does serve and merged into the requested one, which is exact because each divides the other evenly and both open on the same UTC boundaries. Merging also repairs the paging of long ranges at those widths: the reader advanced its cursor by the width it had asked for while the venue was sending a narrower one, so a multi-page range came back with a gap after every page. Reality tokens already worked this way and are unchanged, as is every other exchange.
+
+## [1.23.0] - 2026-09-21
+
+### Added
+
+- Kraken spot orders can be cancelled and placed in bulk, so a group of orders on one pair is no longer paced one at a time by Kraken's per-key request budget. Kraken counts a request, not the orders in it, and allows up to 50 cancellations or 15 placements per request; the connector previously spent two requests per order — one to identify it and one to act — against a budget of 20 requests that refills one request every two seconds, so after the first few every further order waited seconds for its turn. The new bulk cancel reports only the orders it observed the venue cancel, each as the order it really was, and leaves anything it cannot vouch for to the existing one-at-a-time path, including orders that had already filled. The new bulk placement answers every order in the request individually: placed, with the order as the venue holds it, or refused, in the venue's own words. It is never sent twice — a request whose response is lost, or that fails without a worded refusal from the venue, is reported as having an unknown outcome rather than repeated, because repeating it would place the orders a second time — and an order the venue has accepted is always reported as placed, even when it has not yet appeared in a read-back. Both are Kraken spot only; every other exchange keeps the behaviour it has today.
+
+## [1.22.2] - 2026-09-21
+
+### Fixed
+
+- Kraken spot balances now separate funds held by open orders. The balance was read from an endpoint that reports only the wallet total, so everything committed to resting orders came back as `free` with `locked: 0`. The extended balance endpoint is used instead: `locked` is the venue's hold and `free` is what it reports as tradable. Same API key permission as before.
+
+## [1.22.1] - 2026-09-20
+
+### Fixed
+
+- An inverse perpetual's listing states a base step consumers can read. The venue rounds these contracts, not the coin, so the row carried no step at all — which reads downstream as "whole coins only" and would round an order of a fraction of a coin down to nothing.
+
+## [1.22.0] - 2026-09-20
+
+### Added
+
+- Bitget's inverse perpetuals are listed and tradeable again. The venue moved them off the classic API onto its unified one, where they carry a `_CM` name and are sized in whole 1-USD contracts; the classic listing kept only the two quarterly delivery contracts, which is all a coin-margined connection could still see. The perpetuals are now listed from the unified API under the names they have always had, with their prices and candles read from there as well, and orders, positions, fees and leverage go through it. Quantities stay in the base coin on the platform's side of that boundary: an order converts to contracts on the way out, and a position or an order reads back in the base coin, taking the unit from whichever reading the venue's own figures agree with rather than from its documentation. They can only be traded from a Unified Trading Account, so a classic account is told that in those words instead of being told the symbol does not exist; the delivery contracts stay on the classic API.
+
+### Fixed
+
+- A coin-margined Unified Trading Account reports the balances it is actually margined in. The unified wallet was filtered to USDT and USDC for every futures product type, which is right for the linear ones and leaves an inverse account reporting nothing at all — inverse contracts are margined in the coin they are written on.
+
+## [1.21.4] - 2026-09-20
+
+### Fixed
+
+- Bitget fee lookups on a Unified Trading Account now use the account's own rates. The per-pair lookup runs against the classic API, which a unified account refuses on every endpoint; each refusal was turned into a warning and replaced with the pair's publicly listed rate, so the connector calculated with public rates while the account was charged its own — and every listed pair cost one refused request. The refusal is now the fee call's own answer, which routes it to the unified API, where a single request per product line carries every pair's rate.
+- A Bitget API key that is missing the unified account permissions now says what to change. Upgrading an account to Unified does not upgrade the keys it already has, and the venue's wording for the gap ("need uta manage read or uta manage write permissions") names permissions that are not labelled that way when editing a key. The connector now answers with the action instead: edit the key on Bitget and enable UTA management (read) and UTA trading.
+
+## [1.21.3] - 2026-09-19
+
+### Fixed
+
+- A cancelled Kraken spot order is now reported as the order it actually was. Kraken's spot cancel reply says only how many orders it cancelled and nothing about them, so the connector filled in the rest itself — always a buy, always a limit, always at a price of zero, and always as having traded nothing. Those values were then written onto the stored order, so a cancelled sell order was recorded as a buy at no price, and a cancelled order that had already partly traded was recorded as having traded nothing at all. The connector now reports the order as it read it immediately before cancelling — its real price, side, type, size and the quantity it had traded — and looks the order up again after the cancel on the one path that had not read it first. When neither is possible it reports the cancellation without asserting anything it could not establish, leaving the stored order's own values in place.
+
+## [1.21.2] - 2026-09-19
+
+### Fixed
+
+- Hyperliquid order lookups now report the fee under the same asset name the trading pair uses. The fee token on a Hyperliquid fill is the raw spot token name — `UAVAX` for a pair listed as `AVAX-USDC` — and was passed through unmapped, so a fee Hyperliquid took in the base asset was indistinguishable from a fee in an unrelated asset. It is now mapped with the same token table already used for pair names and balances.
+
+## [1.21.1] - 2026-09-18
+
+### Fixed
+
+- Kraken order placements and cancellations are no longer paced more slowly than Kraken itself requires. Kraken meters an order call against two separate budgets — one for the account's API calls and one for the trading pair — and only sends the call when both allow it. The connector charged whichever budget had room even when the other one did not, and because a call that has to wait is asked again once the budget frees up, the same call was charged repeatedly for a request it had not yet sent. The two budgets are now spent together, and only when the call is actually sent, so a burst of orders on one pair — building a grid, or cancelling one after a deal closes — is spaced only as far apart as Kraken's own limits require.
+
+## [1.21.0] - 2026-09-15
+
+### Added
+
+- Bitget Unified Trading Accounts are supported. Bitget runs two account systems, and an account in unified mode is refused by every endpoint of the classic API the connector used, so a unified account could not trade at all. The connector now checks which system each API key's account is in and sends that key's private calls — balances, orders, cancels, order status, open orders, fees, leverage, position mode, positions and key checks — to the matching API. Classic accounts are unaffected. Market data is shared by both systems and is unchanged.
+- Bitget Reality stock tokens (tokenized US stocks such as rAAPL) are listed on Bitget spot, classed as stocks. Bitget only allows them to be traded from a Unified Trading Account; a classic account that picks one gets an explanation instead of an order attempt.
+
+### Fixed
+
+- Bitget spot candles for Reality stock tokens are served at every interval. Bitget only offers them at a few granularities, and its daily and weekly ones start at 16:00 UTC rather than midnight, so the connector reads the finest matching UTC-aligned granularity and combines it into the requested interval — days start at midnight UTC and weeks on Monday, as for every other pair. Previously the daily and weekly requests were rejected for these pairs.
+
+### Known limitations
+
+- Bitget COIN-M futures are not supported for Unified Trading Accounts. The unified COIN-M line is a separate product with different contract symbols and order sizing, so its orders are refused with an explanation rather than routed to it.
+
+## [1.20.25] - 2026-09-12
+
+### Fixed
+
+- Private Kraken spot requests on one API key are now signed and sent one at a time. Kraken accepts a signed request only if its nonce is higher than the last one it accepted for that key, and it judges that when the request arrives. Requests signed a moment apart but sent together could arrive in the opposite order, so Kraken rejected the earlier ones as invalid nonces — and after enough of those it temporarily locks the key, which stops every bot trading on it until the lockout expires. A request that has not answered within ten seconds no longer holds up the requests behind it, requests on different keys still run side by side, and public requests are unaffected.
+- A Kraken nonce rejection is now retried at most three times instead of ten. Each rejected attempt counts toward Kraken's temporary lockout, so the longer retry ladder could turn a short burst of rejections into a lockout.
+
+## [1.20.22] - 2026-09-05
+
+### Fixed
+
+- Binance order numbers are now recorded exactly as the exchange issued them. Binance USDM order numbers have grown past the largest whole number JavaScript can hold precisely, so the connector was rounding the last few digits off every one it received — and because rounding is not reversible, several genuinely different orders ended up filed under the same number. Filled orders were affected, so fills, fees and profit could be attributed to the wrong order, and a cancel or a lookup addressed by that number could reach an order the platform never meant to touch. The connector now reads the order number from the exchange's reply without losing any digits, and sends it back to Binance unchanged. Order numbers small enough to be held precisely are handled exactly as before.
+
+## [1.20.21] - 2026-09-05
+
+### Fixed
+
+- The Kraken connector now sends a short Gainium client order id to Kraken exactly as it is, instead of hashing it first. Kraken only accepts a client order id as a UUID or as free text of at most 18 characters; the previous id was 35 characters long, so it had to be encoded, and the identifier stored against the order was not the one Kraken held. Now the connector looks at the id it is given and picks the right lookup for it: a Kraken transaction id, a short id sent as-is, or an older long id that still goes through the previous encoding and its fallback. Orders placed before this change — including any placed while only one side of the update was live — continue to resolve, so nothing resting on a live account is lost.
+
+## [1.20.20] - 2026-09-05
+
+### Fixed
+
+- Kraken spot orders are now addressed by Kraken's native `cl_ord_id` instead of
+  a derived `userref`, so an order can finally be resolved and cancelled by the
+  client order id it was placed with. The old encoding,
+  `userref = parseInt(clientOrderId.substring(0, 8), 16)`, stops at the first
+  non-hex character: every `D-*` Gainium id collapsed to 13, every `CMB-*` to
+  12, and every `GRID-*` to `NaN` — sent to Kraken as `userref: null`, so grid
+  orders carried no client identifier at all and never resolved, even one at a
+  time. 1.20.19 stopped the resulting collision from resolving to an arbitrary
+  order; this makes the lookup work. `submitOrder` now sends
+  `cl_ord_id: sha256(clientOrderId).slice(0, 32)` (Kraken's short-UUID form —
+  deterministic, so every call site recomputes it with nothing stored, and
+  injective, so two client ids cannot collide) and drops `userref`, which is
+  mutually exclusive with it on AddOrder. `getOrder` matches the `cl_ord_id`
+  Kraken returns on each open-order row, and asks `getClosedOrders` to filter by
+  it. Orders placed before this change carry only a `userref` and stay resting
+  on live accounts until they drain, so the userref scan remains as a fallback —
+  unchanged, ambiguity refusal and all — and now ignores rows carrying some
+  other `cl_ord_id`. `cancelOrder` still resolves through `getOrder` and cancels
+  by the venue txid rather than by `cl_ord_id` directly: the txid it reports
+  back is copied onto the caller's order row, and that write is what left many
+  Kraken txids each claimed by two order rows.
+
+## [1.20.19] - 2026-09-05
+
+### Fixed
+
+- Kraken spot: a client-order-id lookup that matches several orders is now
+  refused instead of resolving to an arbitrary one. Kraken has no
+  client-order-id lookup, so `getOrder` encodes the id as
+  `userref = parseInt(id.substring(0, 8), 16)` — which stops at the first
+  non-hex char, collapsing every `D-*` Gainium id to userref 13 and every
+  `CMB-*` to 12. Both userref scans returned the first entry that matched, so
+  the answer was whichever Gainium order the account happened to list first,
+  presented as an exact resolution. `cancelOrder` feeds that `orderId` straight
+  to `cancelOrder({txid})`, so a cancel aimed at one order cancelled another,
+  and the caller then stored the wrong txid on the order it holds. A userref
+  match is not evidence of identity and is no longer treated as one: one
+  candidate resolves as before, several are reported as an ambiguity worded so
+  it can never be mistaken for the venue saying the order does not exist.
+
+## [1.20.18] - 2026-09-03
+
+### Fixed
+
+- Binance errors whose response body carries no `msg` no longer render as the
+  literal string `[object Object]`. The SDK's `parseException` throws a plain
+  object, not an `Error`, and sets `message` from `response.data?.msg` — so any
+  failure answered with a different JSON shape (proxy and CDN error pages, most
+  visibly on the `.us` domain, which routes through the raw `getPrivate()` call)
+  left `message` undefined and fell through to interpolating the parsed body
+  object. That string became the connector's `reason` and travelled unchanged
+  into the caller's user-visible error, so the only diagnostic the response
+  carried was destroyed at the first hop.
+
+  Both copies of the ladder — the `returnBad` override and `handleBinanceErrors`
+  — now share one `describeBinanceError` helper. Strings pass through untouched
+  so existing message matching is unaffected; non-strings go through
+  `safeStringify`, never `JSON.stringify`, since a thrown exchange error has the
+  failing request stapled to it. Covered by
+  `src/exchange/exchanges/binance/describeBinanceError.spec.ts`.
+
+## [1.20.16] - 2026-09-03
+
+### Added
+
+- CI now runs a real `npm test` (mocha) on every PR. The 17 `*.spec.ts`
+  files under `src/` each ran as a standalone hand-rolled ts-node
+  script before, with no test runner and nothing wiring them into CI —
+  converted to real mocha `describe`/`it`, 329 assertions, verified
+  against a captured baseline for zero drift.
+
+## [1.20.15] - 2026-08-31
+
+### Fixed
+
+- OKX spot orders now pick their trade mode from the account mode instead of always sending `cash`. `cash` is valid only in OKX's Spot and Futures account modes — in Multi-currency margin and Portfolio margin the spot book belongs to the unified margin account and orders must be `cross`, so every order from an account in one of those modes was rejected with "Parameter tdMode error" and the bot could not trade at all. The account mode is read from `account/config` and cached briefly, and an unreadable config still falls back to `cash`.
+
+## [1.20.14] - 2026-08-31
+
+### Fixed
+
+- **Binance spot, USD-M and COIN-M shared ONE raw-request budget, so each throttled the others for no venue reason.** `addRawSpotRequest`, `addRawUsdmRequest` and `addRawCoinmRequest` were three byte-identical functions mutating the same module-level `rawCount`/`rawLastTime` pair, behind the same global mutex key. Futures traffic therefore consumed spot's allowance and reset spot's window, and vice versa — while Binance meters the three as what they are: separate hosts (`api`/`fapi`/`dapi.binance.com`) with separate limits. Each family now has its own counter and window, and the mutex key is scoped per family too (one global lock over three independent counters serialised spot behind futures while protecting nothing). The refund path that hands a slot back when the weight budget parks a call now credits the family that took it, rather than whichever counter happened to be shared.
+
+  **No per-host ceiling changes.** Binance meters per IP *and* per host — `api`, `fapi` and `dapi` are separate services with separate limiters, and no Binance limit is measured against the sum across them ("the limits on the API are based on the IPs, not the API keys"). Spot's raw ceiling was 1800/min before this change and is 1800/min after; so is each futures host's. What changes is only that a family can now reach its own allowance instead of having it consumed by the other two, so worst-case exposure to any single Binance rate limiter is unchanged. `rawLimit` itself is deliberately left at 1800 — this counter is a backstop against a runaway request loop, not a model of the venue, and the weight budget remains the binding constraint by design:
+
+  | host | Binance REQUEST_WEIGHT | Binance RAW_REQUESTS | our weight cap | our raw cap | binds first |
+  |---|---|---|---|---|---|
+  | spot `api` | 6000/min | 300,000 / 5 min | 4500/min | 1800/min | weight |
+  | usdm `fapi` | 2400/min | *none published* | 2000/min | 1800/min | weight |
+  | coinm `dapi` | 2400/min | *none published* | 2000/min | 1800/min | weight |
+
+  For USD-M that ordering is exact: 2000 × 0.85 read reserve ÷ 1.2 multiplier = 1416 reads, against a raw ceiling of 1530. Raising `rawLimit` is a separate decision from fixing the sharing and is deliberately not taken here — note only that the old shared 1800 was ~3% of spot's real raw ceiling, and was additionally charged against two hosts that publish no raw limit at all.
+
+  Not changed, but worth recording: `addWeightUS` never calls the raw counter, so `binanceUS` has no raw backstop of any kind. Left alone rather than invented.
+
+## [1.20.13] - 2026-08-31
+
+### Added
+
+- **`getOrdersBatch` — resolve up to 50 Kraken spot orders in one venue call**, on a new optional `Exchange` method (`POST /orders/batch`). Kraken paces private REST per API key at 20 tokens decaying 0.5/s, and main-app's reconcile pass is a strictly serial `for (…) await getOrder(o)`, so a bot's pass arrives as a burst that drains the bucket in seconds and then parks everything behind it — the user's own `openOrder` included — for the ~2.1s the refusal formula returns. In the field the average Kraken load sits at a small fraction of the budget, but a handful of bursts carry most of the calls — the largest many times over the budget — and a large share of Kraken order placements end up queued, `openOrder` most of all. Kraken itself never rate-limited us — the throttle was entirely self-inflicted by the burst shape. QueryOrders costs the same one token for fifty txids as for one, so such a burst collapses to a handful of calls.
+- The default implementation **declines** rather than looping `getOrder`. A loop would cost the caller exactly what its own loop costs while pinning every call to the single connector instance that received the batch — strictly worse on a venue whose budget is per instance (Binance). Declining keeps every venue without a real batch lookup byte-for-byte on today's path, and leaves the caller's per-order fallback as the only behaviour that runs for them. Only txids are batched: QueryOrders resolves by txid, and the userref path is the ambiguous one every Gainium client id collides on. Kraken Futures keeps the per-order path — `getOrderStatus` already takes `cliOrdIds: string[]`, but its not-found fallback is per order, and half-batching it would be worse than not.
+
+### Fixed
+
+- **A rate-limited Kraken call was sent having taken no token at all.** `checkLimits` asked the budget once, slept for whatever wait it was quoted, and then proceeded without re-asking — but the limiter deliberately does not charge a call it refuses, so every deferred call went to the venue uncounted. The local model was therefore least accurate exactly under load, when it is load-bearing, and it drifted in the direction that produces `EAPI:Rate limit exceeded` with local headroom to spare. It now re-asks after each wait and only proceeds once the budget admits it, bounded at three attempts so a saturated account cannot hold a connector slot open; after the ceiling the call proceeds as it always did, so no new failure mode.
+- **`getClosedOrders` skipped the limiter entirely and was billed at half rate.** The closed-orders fallback in spot `getOrder` — the path taken for every order that is no longer open, i.e. every fill — made a live Kraken call without ever calling `checkLimits`, and `getClosedOrders` is one of Kraken's history endpoints, which it bills at 2 rather than 1. It is now charged, at the heavy cost.
+
+## [1.20.12] - 2026-08-31
+
+### Fixed
+
+- **Coinbase key verification no longer destroys the reason it failed.**
+  `getApiPermission` ended in `.catch(() => returnGood(false))`, reporting every
+  failure as a SUCCESSFUL "no permission" — `{"status":"OK","data":false,
+  "reason":null}` — for a wrong key type, a bad signature, an IP block and a
+  revoked key alike. Coinbase was the only venue whose verification told
+  main-app literally nothing, and it was the largest verification-failure
+  bucket in the field, affecting several users, some of them retrying
+  repeatedly. Because the evidence was discarded here, no amount of
+  message handling downstream could recover it. The verdict is unchanged — a
+  rejection still means "cannot use this key", so no caller's decision moves —
+  only the reason now survives. An authenticated key that simply sees no
+  portfolios still reports `ok/false`, which is a real answer and stays
+  distinct from a rejection.
+- The surfaced message is redacted and capped. Coinbase's SDK staples the
+  signed request onto its errors, so the payload goes through `safeStringify`
+  (verified against an error carrying `apiKey`, a PEM `apiSecret`,
+  `CB-ACCESS-KEY` and `CB-ACCESS-SIGN` — all four blanked) and is truncated at
+  300 characters, because this string now reaches a user-facing message in
+  main-app rather than only a log line.
+
+## [1.20.11] - 2026-08-30
+
+### Fixed
+
+- **Binance order placement was queued behind background reads and could only go out in the first ~10s of each minute.** The per-minute weight/raw budgets are one undifferentiated pool, and a request that exhausts them is not dropped but PARKED until `weightFrame - (time % weightFrame)` — the top of the next minute, which is when Binance itself resets the counter. Reads vastly outnumber order calls: in the field the great majority of parked Binance calls were `getOrder`, with only a small fraction `openOrder`. The fresh budget was therefore consumed within seconds of every rollover, so binanceUsdm grid bots could only place between second 0 and ~10 of a minute — a filled grid level waited up to 3 minutes for its replacement order, with that price level absent from the book meanwhile. Order placement and cancellation now spend against the full budget while everything else stops at 85% of it, on all four Binance domains and on the shared raw-request counter (which is the one that binds first on spot). Nothing raises the total sent to Binance.
+- **A parked request still consumed budget.** The counters were incremented before the ceiling check and never rolled back on refusal, so they measured ATTEMPTS rather than what was actually sent: every parked attempt inflated the window further, holding it shut longer than the venue does and publishing a usage figure above 1.0 on the `exchangeLimits` channel exchange-balancer routes by (a usage figure well above the 1.0 scale). The raw slot was already handed back here; the weight now is too.
+
+## [1.20.10] - 2026-08-28
+
+### Fixed
+
+- **The pair-scoped fee lookup made the hourly fee sweep longer than its own period.** 1.20.4 asked TradeVolume about every pair in 50-pair chunks — 33 calls per account. Kraken paces private REST per API KEY (counter ~15-20, decay ~0.5/s), so that is ~66s per account and, across every Kraken connection, far longer than the sweep's own period: passes overlapped, and accounts late in the iteration stopped being refreshed at all. It was invisible until the lockout fix, because before that TradeVolume failed FAST and never paid the pacing cost. Kraken bills per published SCHEDULE rather than per pair — an account collapses to 3-5 distinct rates across all ~1614 pairs — so the lookup now probes ONE representative pair per published fee class and applies the venue's answer to that class, 1 call per account instead of 33 (minutes instead of the best part of an hour). The grouping key is Kraken's own published ladder, so two pairs share a probe only where Kraken itself puts them on the same schedule.
+
+## [1.20.9] - 2026-08-28
+
+### Fixed
+
+- **A Kraken `EGeneral:Temporary lockout` was retried, which extends the lockout.** It sat on the generic ladder — 10 attempts at 1s->10s, ~74s of hammering — and because the ramp is per-request state that resets on every new call, each caller kept starting a fresh one. Since the connector's ladder multiplies with main-app's own unknown-order ladder, single order ids were driven 20-90 `getOrder` calls deep, ~15x the caller's ceiling, producing repeated lockout episodes. A lockout is the one retryable-looking class where every attempt makes the penalty worse, so it now gets zero attempts and surfaces immediately; the caller's own loop retries later, by which point the lockout has expired on its own. Rate limits and provider outages keep their existing paced 3, ordinary transients keep the full ladder.
+- `getSpotOrderByTxid` no longer swallows a lockout or rate-limit rejection. Its `catch` returned null for every failure, which sends the caller down the userref fallback — a SECOND request to the account Kraken has just told us to stop calling, doubling the load at the only moment it must not. Those two classes now rethrow so the caller backs off; everything else still falls back as before.
+
+## [1.20.8] - 2026-08-27
+
+### Added
+
+- **Every remaining venue now records the fee it actually charged**, extending the Kraken capture in 1.20.6 to Binance, Bybit, OKX, KuCoin, Bitget, Coinbase and Hyperliquid. `CommonOrder` gains `feeBreakdown` alongside the existing `feePaid` / `feeSide` / `feeAsset`; all four are optional and additive, so the platform's most load-bearing contract is unchanged for every existing consumer. Each venue is read from its OWN field, never computed as `qty * price * rate` — which is the estimate this replaces: Bybit `cumExecFee` (with `cumFeeDetail` preferred whenever Bybit sends the currency map), OKX `fee` + `feeCcy`, KuCoin `fee` + `feeCurrency` (per-fill when fills were fetched), Bitget futures `fee` settled in `marginCoin` and Bitget spot's `feeDetail` blob, Coinbase `total_fees`, Hyperliquid's per-fill `fee` + `feeToken`, and Binance's `fills[].commission` + `commissionAsset`.
+- **Binance spot placement now asks for the `FULL` response instead of `RESULT`.** `fills[]` — the only order-scoped place Binance states a commission — appears only on `FULL`, and Binance charges the same request weight for `ACK`, `RESULT` and `FULL`, so this observation was always free and simply never requested. `CommonOrder.fills` is populated from it as well, having previously been hard-coded to `[]`.
+
+### Notes
+
+- Three shapes of "which asset" are carried, because the venues genuinely differ and none of it is safe to assume. `feeAsset` holds the venue's own ticker (which may be neither side of the pair — BNB on Binance, BGB on Bitget, KCS on KuCoin). `feeSide` names a side of the pair for the venues that answer that way instead: Kraken via `oflags`, Coinbase (which settles every fee in quote and so has no currency field), and Bybit derivatives (settle coin: quote for linear, base for inverse) and spot (the asset received — base on a buy, quote on a sell). `feeBreakdown` carries the legs when one order was charged in more than one currency, and `feePaid` is deliberately left unset there so a consumer reading only `feePaid` cannot mistake one leg for the whole cost.
+- **A fee that cannot be observed is omitted, never reported as `0`.** A zero would tell the caller the fill was free and would replace a roughly-right estimate with a definitely-wrong observation; an absent field leaves `deal.commission`'s estimate in force. Negative venue figures (OKX, Bitget and Hyperliquid report a charge as negative) are normalised to the magnitude of the cost.
+- **Binance futures report no fee here on purpose.** Neither the placement response nor `GET /fapi/v1/order` carries a commission field at all; the fee arrives on the `ORDER_TRADE_UPDATE` user-stream event, which already reaches main-app, so capturing it belongs there rather than behind an extra weighted `userTrades` request per order.
+- Covered by two standalone ts-node checks (this repo has no test runner): `src/exchange/helpers/orderFee.spec.ts` for the normalisation rules, and `src/exchange/exchanges/venue-fee-capture.spec.ts` for each venue's mapper against a payload shaped the way that venue sends it.
+
+## [1.20.7] - 2026-08-27
+
+### Added
+
+- `UserFee.source` (`'venue' | 'ladder'`, optional/additive) says whether a rate is what the exchange reported for THIS account or the published schedule's entry rung we fell back to. A degraded lookup was previously invisible: the fallback returns a plausible number with `status: OK`, so a stale rate was written to the user's fees with nothing logged. The connector cannot name the account — `AuthData` carries credentials only, no userId or uuid — so it now also stamps its TradeVolume warnings with the account's key fingerprint (a djb2 hash, never the key), and main-app's fee sweep logs the user and connection whenever it receives `ladder` rates.
+
+## [1.20.6] - 2026-08-27
+
+### Added
+
+- **The fee Kraken actually charged is now recorded on the order** (`feePaid` + `feeSide` on `CommonOrder`, both optional and additive). Kraken returns `fee` and `oflags` on every `QueryOrders` / open-orders / closed-orders payload — fields the connector already fetched on every Kraken spot order lookup and discarded. `deal.commission` has always been an ESTIMATE (`qty * price * storedFeeRate`), and an estimate is only as good as the stored rate, and Kraken accounts are routinely found carrying a rate matching no tier in Kraken's live schedule (the public `AssetPairs` ladder is stale — its first rung 0.40%/0.25% is not a real tier; Kraken's actual Tier 1 is 0.80%/0.40%), so the commission booked for them can be about half the true cost. An observed fee cannot go stale that way. `feeSide` carries which side of the pair the fee came out of, taken from the `oflags` Kraken echoes rather than assumed — its defaults are asymmetric (`fciq`/quote on a buy, `fcib`/base on a sell) and we set no flag when placing. A fee we cannot observe is omitted entirely, so the existing estimate stays in force and a missing fee never books as zero cost.
+
 ## [1.20.5] - 2026-08-27
 
 ### Changed
@@ -15,20 +398,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **A negotiated Kraken rate was still invisible to the hourly fee sweep.** 1.20.3 placed each account on the PUBLISHED ladder by its 30-day volume — right for tiered accounts, but a negotiated rate exists on no ladder: a live account with ~5k EUR of volume pays 0.10% taker / 0.00% maker, and the ladder says 5k = tier 0 = 0.40%/0.25%. Kraken only reveals the real rate on PAIR-SCOPED `TradeVolume` calls, so `getAllUserFees` now batches the pair list through it (~50 pairs per call, ~14 calls per account per sweep, result cached 10 minutes) and the ladder remains the fallback for anything the batch cannot answer — a failed chunk, tokenized pairs (excluded on purpose so an asset-class refusal cannot poison 50 crypto pairs), or missing credentials. A zero fee (0.00% maker) is preserved as a real rate, not mistaken for missing.
+- **A negotiated Kraken rate was still invisible to the hourly fee sweep.** 1.20.3 placed each account on the PUBLISHED ladder by its 30-day volume — right for tiered accounts, but a negotiated rate exists on no ladder: an account on a negotiated rate can pay a fraction of what the ladder's entry rung of 0.40%/0.25% says it should. Kraken only reveals the real rate on PAIR-SCOPED `TradeVolume` calls, so `getAllUserFees` now batches the pair list through it (~50 pairs per call, ~14 calls per account per sweep, result cached 10 minutes) and the ladder remains the fallback for anything the batch cannot answer — a failed chunk, tokenized pairs (excluded on purpose so an asset-class refusal cannot poison 50 crypto pairs), or missing credentials. A zero fee (0.00% maker) is preserved as a real rate, not mistaken for missing.
 - The TradeVolume-failure warning now logs Kraken's actual error. The SDK wraps a Kraken-level rejection (HTTP 200 + non-empty `error`) as `{message: statusText, body}`, so the fallback line logged literally "OK" — the real reason ("EGeneral:Permission denied", …) lives in `body.error` and is now what gets printed.
 
 ## [1.20.3] - 2026-08-27
 
 ### Fixed
 
-- **Kraken spot fees were the published lowest-volume tier for every account, never the account's own.** `getUserFees` / `getAllUserFees` read `fees[0]` off the PUBLIC `AssetPairs` ladder — its own comment said "first tier (highest fee for lowest volume)" — so every Kraken user on the platform traded against 0.40% taker / 0.25% maker regardless of their 30-day volume or a negotiated rate, and the private `TradeVolume` endpoint was never called. This is not a display number: main-app grosses a spot LONG base order up by `1 + taker` before sending it (`dcaHelper` `feeFactor`) and sizes take-profit quantity and price displacement against the same figure, so a user on a better tier silently bought more than they configured — a 1521.81 EUR base order went to the wire as 1527.897 EUR of notional. The account's schedule now comes from `TradeVolume`: a pair-scoped call returns that pair's own rate (authoritative even for a negotiated one), and a single pairless call returns the 30-day volume, which places the account on the published ladder for every pair at once. Every failure path — no credentials, missing permission, a transient error — falls back to the ladder's first rung, i.e. byte-for-byte the old behaviour, so a `TradeVolume` hiccup can never surface as a failed fee fetch and start tripping main-app's `feeAuthDisabled` key-disabling backoff. Result cached for 10 minutes per account so the hourly fee sweep costs one extra private call per Kraken account. Kraken **futures** (`krakenUsdm`) still returns its hardcoded 0.02%/0.05% defaults and is unchanged.
+- **Kraken spot fees were the published lowest-volume tier for every account, never the account's own.** `getUserFees` / `getAllUserFees` read `fees[0]` off the PUBLIC `AssetPairs` ladder — its own comment said "first tier (highest fee for lowest volume)" — so every Kraken user on the platform traded against 0.40% taker / 0.25% maker regardless of their 30-day volume or a negotiated rate, and the private `TradeVolume` endpoint was never called. This is not a display number: main-app grosses a spot LONG base order up by `1 + taker` before sending it (`dcaHelper` `feeFactor`) and sizes take-profit quantity and price displacement against the same figure, so a user on a better tier silently bought more than they configured — a base order went to the wire carrying 0.4% more notional than configured. The account's schedule now comes from `TradeVolume`: a pair-scoped call returns that pair's own rate (authoritative even for a negotiated one), and a single pairless call returns the 30-day volume, which places the account on the published ladder for every pair at once. Every failure path — no credentials, missing permission, a transient error — falls back to the ladder's first rung, i.e. byte-for-byte the old behaviour, so a `TradeVolume` hiccup can never surface as a failed fee fetch and start tripping main-app's `feeAuthDisabled` key-disabling backoff. Result cached for 10 minutes per account so the hourly fee sweep costs one extra private call per Kraken account. Kraken **futures** (`krakenUsdm`) still returns its hardcoded 0.02%/0.05% defaults and is unchanged.
 
 ## [1.20.2] - 2026-08-26
 
 ### Fixed
 
-- **Hyperliquid `cummulativeQuoteQty` was the REMAINING notional, not the executed one.** HL reports `sz` on a resting order as the size still open, and `convertOrder` priced the quote off it (`limitPx * sz`): an untouched open order reported its full notional as executed, a fully filled one reported 0, and a canceled partially-filled TP reported the remainder's notional against a tiny `executedQty`. main-app derives the booked price as `cummulativeQuoteQty / executedQty`, so during the 2026-08-26 deploy restart one live DCA deal (TP 0.472 filled 0.025, canceled by the reload) was closed at a phantom price of ~1539 instead of 86.082 and booked +$684 on a $40 position. Quote is now `(origSz - sz) * price`, the fills-based price lookup also runs for canceled orders that carry partial fills, and a filled MARKET order without a fills price reports 0 rather than its slippage-padded IOC request price. Pinned by `convert-order-executed-quote.spec.ts`.
+- **Hyperliquid `cummulativeQuoteQty` was the REMAINING notional, not the executed one.** HL reports `sz` on a resting order as the size still open, and `convertOrder` priced the quote off it (`limitPx * sz`): an untouched open order reported its full notional as executed, a fully filled one reported 0, and a canceled partially-filled TP reported the remainder's notional against a tiny `executedQty`. main-app derives the booked price as `cummulativeQuoteQty / executedQty`, so a DCA deal whose take-profit was canceled part-filled by a restart could be closed at a phantom price orders of magnitude above the real one and book a large fictitious profit. Quote is now `(origSz - sz) * price`, the fills-based price lookup also runs for canceled orders that carry partial fills, and a filled MARKET order without a fills price reports 0 rather than its slippage-padded IOC request price. Pinned by `convert-order-executed-quote.spec.ts`.
 
 ## [1.20.1] - 2026-08-25
 
@@ -41,7 +424,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `getReferralStatus()`, `setReferralCustomerId()` and `getTraderSummary()` on the exchange interface, implemented for Binance and defaulting to "not supported" everywhere else. `getReferralStatus` is signed with the **user's** credentials and answers whether that account earns broker commission: it needs BOTH `isNewUser` (the account registered after we joined the program — fixed at their signup) and `rebateWorking` (not bound to another referral, below VIP 3 — can change over time). `supported: false` means the venue has no such API and must be read as "no opinion", never as "not earning". Note the apiReferral endpoints want the BARE agent code, not the `x-`-prefixed `newClientOrderId` form, which they reject with `-9000 AgentCode is not exist`.
-- `setReferralCustomerId()` registers an id for the credentials so the broker-side per-trader report is keyed by something joinable. Without it the venue reports a masked email (`el***87@***.com`), which cannot be matched to a user.
+- `setReferralCustomerId()` registers an id for the credentials so the broker-side per-trader report is keyed by something joinable. Without it the venue reports a masked email address, which cannot be matched to a user.
 
 ### Fixed
 
@@ -52,39 +435,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Funding history for OKX Europe X-Perps asked OKX for an instrument that doesn't exist.** `getFundingRateHistory` called `ensureXperpMap()` without the symbol hint, and that guard bails out unless the instance is EU-perp (`okxSource=my` + futures) *or* the hint says the symbol is an X-Perp. main-app's hourly funding cron builds the exchange with `choose('', '')` — a keyless instance, so `okxSource` is never set and `isEuPerp` is false — so the map stayed empty and `updateSymbol` handed OKX the bare instFamily (`SOL-USD_UM_XPERP`) instead of the live instId (`SOL-USD_UM_XPERP-310404`). OKX answered `51001 Instrument ID … doesn't exist` every hour, and no funding event was published for that symbol at all. Measured on prod: 72 identical hourly failures for `SOL-USD_UM_XPERP` since 2026-08-21, and the same shape on `XRP-USD_UM_XPERP` on 08-08 — it is every X-Perp symbol that holds a position, not one poisoned registry entry. Passing the hint (as `getNewCandles`, `getHistoricCandles` and `futures_changeLeverage` already do) populates the map from the global keyless rail, which does serve these instruments — the same rail `getXperpTickers` relies on for anonymous price lists.
+- **Funding history for OKX Europe X-Perps asked OKX for an instrument that doesn't exist.** `getFundingRateHistory` called `ensureXperpMap()` without the symbol hint, and that guard bails out unless the instance is EU-perp (`okxSource=my` + futures) *or* the hint says the symbol is an X-Perp. main-app's hourly funding cron builds the exchange with `choose('', '')` — a keyless instance, so `okxSource` is never set and `isEuPerp` is false — so the map stayed empty and `updateSymbol` handed OKX the bare instFamily (`SOL-USD_UM_XPERP`) instead of the live instId (`SOL-USD_UM_XPERP-310404`). OKX answered `51001 Instrument ID … doesn't exist` every hour, and no funding event was published for that symbol at all. This surfaced as repeated identical hourly failures for `SOL-USD_UM_XPERP`, and the same shape on `XRP-USD_UM_XPERP` — it is every X-Perp symbol that holds a position, not one poisoned registry entry. Passing the hint (as `getNewCandles`, `getHistoricCandles` and `futures_changeLeverage` already do) populates the map from the global keyless rail, which does serve these instruments — the same rail `getXperpTickers` relies on for anonymous price lists.
 
 ## [1.19.14] - 2026-08-22
 
 ### Fixed
 
-- **Kraken Futures positions reported a hardcoded leverage of 1.** Kraken's position payload carries no leverage — it is a per-contract account preference — and `futures_convertPosition` filled in `leverage: '1', isolated: false`. The bot engine's pre-start check compares that with the bot's own leverage, so every Kraken futures bot above 1x refused to start into an existing position with "Leverage in active position is 1, but in settings 2" (119 live bots across 54 users at the time of the fix; users worked around it by dropping their bots to 1x). `futures_getPositions` now reads the account's leverage preferences once (`GET /derivatives/api/v3/leveragepreferences`) and labels each position with its isolated `maxLeverage`; a contract with no preference is cross (`leverage: '0', isolated: false`), and a failed read leaves leverage `'0'` as well — "not an isolated leverage", which consumers must not compare (main-app core 1.52.8 treats 0 as unknown).
+- **Kraken Futures positions reported a hardcoded leverage of 1.** Kraken's position payload carries no leverage — it is a per-contract account preference — and `futures_convertPosition` filled in `leverage: '1', isolated: false`. The bot engine's pre-start check compares that with the bot's own leverage, so every Kraken futures bot above 1x refused to start into an existing position with "Leverage in active position is 1, but in settings 2" (users worked around it by dropping their bots to 1x). `futures_getPositions` now reads the account's leverage preferences once (`GET /derivatives/api/v3/leveragepreferences`) and labels each position with its isolated `maxLeverage`; a contract with no preference is cross (`leverage: '0', isolated: false`), and a failed read leaves leverage `'0'` as well — "not an isolated leverage", which consumers must not compare (main-app core 1.52.8 treats 0 as unknown).
 
 ## [1.19.13] - 2026-08-21
 
 ### Fixed
 
-- OKX Europe X-Perps are now USDC-quoted. OKX reports their settlement currency as the unified-margin label "USD", which no EU account holds, so every X-Perp pair failed the balance check and bots could never open a deal (reported by discord2020 in the Phase-2 beta, forum topic 4925).
+- OKX Europe X-Perps are now USDC-quoted. OKX reports their settlement currency as the unified-margin label "USD", which no EU account holds, so every X-Perp pair failed the balance check and bots could never open a deal.
 
 ## [Unreleased]
 
 ### Fixed
 
-- **Users could not connect an OKX account at all: verification turned one click into ~20 identical calls to a per-UserID rate-limited endpoint, then backed off for longer than the caller's whole budget.** An `addExchange` for "OKX SPOT & Futures" issues the spot and futures verify probes concurrently; each goes out `sendtoall`, which the balancer fans over **every** private connector instance concurrently and then awaits with `Promise.all`; and inside each instance `withPermissions` races `getApiPermission()` against `getKeyPermissions()` — which on OKX are **the same** `GET /api/v5/account/config`. Two legs x five instances x two calls is ~20 requests in one second against a limit OKX applies per **UserID**, not per IP, so no amount of egress spreading helps. The local `checkLimits` guard cannot see any of it: it is per-process, and `getKeyPermissions()` bypassed it entirely. OKX answers the excess with `50011`, and the retry ladder was `(attempts + 1) * 10000` — a **20 second** first sleep, against a rate-limit window measured in seconds and inside main-app's 30s `VERIFY_TIMEOUT_MS`. Because the balancer waits for every leg, **one** throttled instance out of five was enough to blow the entire add; the user saw "The exchange did not respond in time" and had no way through. Two changes, either of which would help and which together remove the failure: `account/config` reads now share their **in-flight** promise, so concurrent callers on one client cost one request instead of two (a settled promise is never reused — account config is mutable and long-lived bot clients must keep reading it fresh); and the `50011` backoff is now jittered exponential, 1s -> 2s -> 4s -> 8s capped, randomised over [0.5x, 1.5x]. The jitter is load-bearing rather than cosmetic: the fan-out legs are issued and throttled in the same millisecond, so a deterministic ladder had all five choose an identical 20 000ms, wake together and collide again — the same lockstep pathology as the Kraken nonce collision (bug #329). Measured on prod: 20 failed OKX connection attempts across **five** users between 2026-08-04 and 2026-08-21 (`bernhard@kanduth.at`, `durstloescher2013@gmx.de`, `christian.hornhues@gmail.com`, `freakytrader@protonmail.com`, `discord2020@elvalet.de`), every one of them carrying the same `OKX Too many requests sleep 20s, getApiPermission` fingerprint across multiple connector instances in the same minute, and the 08-21 attempt matching to the second — probes throttled at 09:59:52, escalating to a 30s sleep at 10:00:12, main-app giving up at 10:00:22.738 "30012ms into the mutation". That is **more** timeouts than genuine bad-key rejections among failed OKX adds in the retained logs, and `getApiPermission` accounts for 431 of the 542 OKX rate-limit sleeps in the archive. Self-hosted installs were never affected — a single connector makes two calls and stays under the limit, which is exactly why the reporter's own localhost build worked while the cloud did not. Note `sendtoall` is deliberately left in place on verify: the balancer floats successful legs to the front of its result sort, so verification passes if **any** egress IP is whitelisted, which is what makes partially-whitelisted keys work at all. Verified against the real class with a stubbed transport — concurrent probes drop 2 requests to 1, a sequential follow-up still re-requests, a single `50011` recovers in ~0.6s instead of 20.0s, and five identically-throttled legs pick five distinct backoffs instead of one shared 20 000ms; all five checks fail on the pre-fix code.
+- **Users could not connect an OKX account at all: verification turned one click into a burst of identical calls to a per-UserID rate-limited endpoint, then backed off for longer than the caller's whole budget.** An `addExchange` for "OKX SPOT & Futures" issues the spot and futures verify probes concurrently; each goes out `sendtoall`, which the balancer fans that out concurrently and then awaits with `Promise.all`; and inside each instance `withPermissions` races `getApiPermission()` against `getKeyPermissions()` — which on OKX are **the same** `GET /api/v5/account/config`. Two legs, fanned out, times two calls is a burst of requests in one second against a limit OKX applies per **UserID**, not per IP, so spreading them across addresses does not help. The local `checkLimits` guard cannot see any of it: it is per-process, and `getKeyPermissions()` bypassed it entirely. OKX answers the excess with `50011`, and the retry ladder was `(attempts + 1) * 10000` — a **20 second** first sleep, against a rate-limit window measured in seconds and inside main-app's 30s `VERIFY_TIMEOUT_MS`. Because the balancer waits for every leg, **one** throttled leg was enough to blow the entire add; the user saw "The exchange did not respond in time" and had no way through. Two changes, either of which would help and which together remove the failure: `account/config` reads now share their **in-flight** promise, so concurrent callers on one client cost one request instead of two (a settled promise is never reused — account config is mutable and long-lived bot clients must keep reading it fresh); and the `50011` backoff is now jittered exponential, 1s -> 2s -> 4s -> 8s capped, randomised over [0.5x, 1.5x]. The jitter is load-bearing rather than cosmetic: the fan-out legs are issued and throttled in the same millisecond, so a deterministic ladder had every leg choose an identical 20 000ms, wake together and collide again — the same lockstep pathology as the earlier Kraken nonce collision. Every failed add carried the same `OKX Too many requests sleep 20s, getApiPermission` fingerprint: probes throttled, escalating to a 30s sleep, and the caller giving up just past its 30s budget. Self-hosted installs were never affected — a single connector makes two calls and stays under the limit. Note `sendtoall` is deliberately left in place on verify: the balancer floats successful legs to the front of its result sort, so verification passes if **any** leg succeeds, which is what makes partially-whitelisted keys work at all. Verified against the real class with a stubbed transport — concurrent probes drop 2 requests to 1, a sequential follow-up still re-requests, a single `50011` recovers in ~0.6s instead of 20.0s, and identically-throttled legs pick distinct backoffs instead of one shared 20 000ms; all five checks fail on the pre-fix code.
 
-- **A Coinbase connection the venue rejects made the whole portfolio refresh take ~19 seconds.** `handleCoinbaseErrors` classified a 401 `Unauthorized` as retryable and ran the full `retry = 10` ladder at a flat 2s sleep, so a revoked / expired / wrong-type key cost ~18 000ms of pure waiting before returning the same `NOTOK / Unauthorized` it could have returned immediately — 10 rejected requests at Coinbase for every one the platform needed to make, and 195k `Coinbase Unauthorized wait 2000s` lines across the log archive. What that costs the user is not on this service: main-app's `updateUserBalance` refreshes EVERY stored connection on a portfolio refresh and its worker pool waits for all of them, so ONE dead Coinbase connection set the wall clock of the entire `updateBalance` GraphQL resolver. Measured on prod 2026-08-11 as `[SlowGraphQL] op=updateBalance ms=19442..19742` sustained over seven distinct minutes for `marioenzler69@gmail.com`, with the identical 19.3–20.8s band on every other affected user — and all of them, and only them, hold a Coinbase connection already flagged `status: false`. Users with the same venue count and far more balances but no Coinbase connection never entered the band, which is what rules out the fan-out itself. A 401 is the venue's verdict on the credentials, not a blip, so it now reports after a SINGLE re-try (the shape `internalTimeout` already uses) — ~2s instead of ~18s. Every other retryable Coinbase signature keeps its existing ladder; a valid key is untouched. Covered by `unauthorized-retry.spec.ts` (run by hand — these specs have no runner in CI).
+- **A Coinbase connection the venue rejects made the whole portfolio refresh take ~19 seconds.** `handleCoinbaseErrors` classified a 401 `Unauthorized` as retryable and ran the full `retry = 10` ladder at a flat 2s sleep, so a revoked / expired / wrong-type key cost ~18 000ms of pure waiting before returning the same `NOTOK / Unauthorized` it could have returned immediately — 10 rejected requests at Coinbase for every one the platform needed to make, and a `Coinbase Unauthorized wait 2000s` line for each. What that costs the user is not on this service: main-app's `updateUserBalance` refreshes EVERY stored connection on a portfolio refresh and its worker pool waits for all of them, so ONE dead Coinbase connection set the wall clock of the entire `updateBalance` GraphQL resolver. A 401 is the venue's verdict on the credentials, not a blip, so it now reports after a SINGLE re-try (the shape `internalTimeout` already uses) — ~2s instead of ~18s. Every other retryable Coinbase signature keeps its existing ladder; a valid key is untouched. Covered by `unauthorized-retry.spec.ts` (run by hand — these specs have no runner in CI).
 
-- **A Kraken Futures order the venue no longer had was reported as resting on the book, so it could never be cleared.** `getOrderStatus` answers about orders that are open, or were filled or cancelled in the last 5 seconds — but for an id outside that window Kraken still returns an *element*, one that carries no usable `status`. `getOrder` passed it through as `orderInfo.status || 'NEW'`, turning "we do not know this order" into the one answer that means the opposite. What that costs is a permanent phantom: main-app cancels the order, Kraken answers `notFound`, the cancel surfaces as `Unknown order`, and `_handleUnknownOrder` re-reads the order here — and is told `NEW`. Because that is a *successful* read, main-app clears its `canceledMap` retry counter every pass, so the 5-attempt force-cancel written for exactly this case is never reached. Observed on a live Kraken Futures grid bot: order `GRID-RO-1w23…` / `a26e32f1-…` sat at `NEW` in Mongo from 2026-08-05, re-attempting the cancel roughly four times a day, holding a dead grid level, with an `Unknown order` error line on the connector each time. A status element is now only trusted when it carries a status Kraken documents for a real order; anything else falls through to the existing `getOrderEvents` lookup, which either resolves the true outcome (a phantom whose cancellation is in history now reconciles straight to CANCELED) or fails and lets main-app reconcile — the path already proven in production on `CMB-GR-…` orders. Nothing here asserts a cancel the venue did not state, so the 1.19.9 fill-race guarantee is untouched. `mapOrderStatus`'s unknown → `NEW` default is deliberately left alone: it is shared with the spot paths and is not in evidence. Covered by `phantom-order-status.spec.ts` (run by hand — these specs have no runner in CI).
+- **A Kraken Futures order the venue no longer had was reported as resting on the book, so it could never be cleared.** `getOrderStatus` answers about orders that are open, or were filled or cancelled in the last 5 seconds — but for an id outside that window Kraken still returns an *element*, one that carries no usable `status`. `getOrder` passed it through as `orderInfo.status || 'NEW'`, turning "we do not know this order" into the one answer that means the opposite. What that costs is a permanent phantom: main-app cancels the order, Kraken answers `notFound`, the cancel surfaces as `Unknown order`, and `_handleUnknownOrder` re-reads the order here — and is told `NEW`. Because that is a *successful* read, main-app clears its `canceledMap` retry counter every pass, so the 5-attempt force-cancel written for exactly this case is never reached. The order can therefore sit at `NEW` in the database indefinitely, re-attempting the cancel and holding a dead grid level, with an `Unknown order` error line on the connector each time. A status element is now only trusted when it carries a status Kraken documents for a real order; anything else falls through to the existing `getOrderEvents` lookup, which either resolves the true outcome (a phantom whose cancellation is in history now reconciles straight to CANCELED) or fails and lets main-app reconcile — the path already proven on combo-grid orders. Nothing here asserts a cancel the venue did not state, so the 1.19.9 fill-race guarantee is untouched. `mapOrderStatus`'s unknown → `NEW` default is deliberately left alone: it is shared with the spot paths and is not in evidence. Covered by `phantom-order-status.spec.ts` (run by hand — these specs have no runner in CI).
 - **Kraken Futures orders were recorded at the price we asked for rather than the price the venue charged, and nothing said so.** `futures_getAvgFillPrice` — the only thing standing between a Kraken futures fill and being booked at its limit price — ended in a bare `catch { return null }`. Every failure looked identical to "this order has no fills yet", so a key that is permanently refused the fills endpoint degraded exactly like a one-off rate limit, forever, invisibly. Three things change:
   - **The execution price now comes from the order-placement response**, where Kraken has been stating it all along. A submit answers with `sendStatus.orderEvents` containing `EXECUTION` entries carrying an exact price and amount per fill; the connector discarded them and re-fetched the order instead, and the re-fetch's only price source is `getOrderStatus`, which exposes the **limit** price and nothing else. For a MARKET order that means the recorded price was the price we requested, with all slippage erased — the fill could walk the book arbitrarily far and the record would not move. The events are free, exact, in the same round trip, and need no extra key permission, so they are now the primary source and the fills endpoint is only a fallback. Measured against recorded history this is where essentially all of the mispricing sat: limit orders were already right (a resting limit fills at its limit), market orders were not.
   - **A permanent failure is no longer indistinguishable from a transient one.** Kraken refuses a key that lacks the query-trades permission with `{result:'error', error:'authenticationError'}` at **HTTP 200**, so it cannot be recognised by status code; the history endpoints refuse with a transport 401. Those are now classified as permanent and logged at `error` stating plainly that orders for that key are being recorded at their limit price, while rate limits, timeouts and 5xx stay a quiet `warn`. Both are rate-limited to once an hour per key so a busy account cannot bury the signal — which is what the previous silence amounted to. The API key is never logged, only a short non-reversible fingerprint, and the reason goes through `safeStringify` because Kraken SDK error objects can carry live credentials. A lookup that simply found no matching fill is still not an error and is not logged: `getFills()` returns the most recent page, so an older fill legitimately is not in it.
   - Order recording still never fails over a price refinement — the fallback to the limit price is retained deliberately, it is just no longer silent.
-- **Corrects the record set by 1.19.8.** That entry stated Kraken refuses the fills endpoint "for the API keys our users grant" and that `/accountFills` therefore "returns NOTOK for most accounts". That generalised from two accounts and is wrong: `futures_getAvgFillPrice` calls the very same endpoint with the same credentials from inside this connector, and recorded order history from before that measurement carries — on many accounts, over a long window — an average fill price that only that call can produce. The endpoint authenticates routinely for the large majority of accounts. Why those two refused is still unexplained; a granular per-key permission remains the likeliest reason, it is simply not universal. The comment on `getAccountFills` has been rewritten accordingly. The decision to remove the unverified executions-history fallback stands — it never once executed.
+- **Corrects the record set by 1.19.8.** That entry stated Kraken refuses the fills endpoint "for the API keys our users grant" and that `/accountFills` therefore "returns NOTOK for most accounts". That generalised from a very small sample and is wrong: `futures_getAvgFillPrice` calls the very same endpoint with the same credentials from inside this connector, and recorded order history from before that measurement carries — on many accounts, over a long window — an average fill price that only that call can produce. The endpoint authenticates routinely for the large majority of accounts. Why those accounts refused is still unexplained; a granular per-key permission remains the likeliest reason, it is simply not universal. The comment on `getAccountFills` has been rewritten accordingly. The decision to remove the unverified executions-history fallback stands — it never once executed.
 
 ### Added
 
 - `futures_readExecutionPrice()` — pure, shared reader turning a batch of Kraken order events into a size-weighted average execution price and total quantity, returning "nothing executed" rather than a price when the batch carries no `EXECUTION` (so a resting limit order can never be overwritten with an invented fill). The cancel path's inline copy of this logic now delegates to it. Covered by `fill-price.spec.ts` alongside the permanent-vs-transient failure classifier; `cancel-verdict.spec.ts` still passes unchanged. Note these specs have **no runner in CI** and must be run by hand.
-- `GET /accountFills` documents that Kraken refuses it for the API keys our users grant: `/derivatives/api/v3/fills` answers `authenticationError` and `api/history/v3/executions` answers HTTP 401, on two unrelated accounts, while `/derivatives/api/v3/accounts` authenticates fine on the same keys, egress IP and signing path. Kraken Futures permissions are granular and ours appear not to include reading trade history. The executions-history fallback added in 1.19.7 has been **removed**: the call never got through, so its mapping never once executed — unverified code implying a working path that does not exist, against a payload the SDK types as `any`. The endpoint itself is kept, typed against the SDK's own `FuturesFill`, and starts working the moment a key carries the permission.
+- `GET /accountFills` documents that Kraken refuses it for the API keys our users grant: `/derivatives/api/v3/fills` answers `authenticationError` and `api/history/v3/executions` answers HTTP 401, on unrelated accounts, while `/derivatives/api/v3/accounts` authenticates fine on the same keys and signing path. Kraken Futures permissions are granular and ours appear not to include reading trade history. The executions-history fallback added in 1.19.7 has been **removed**: the call never got through, so its mapping never once executed — unverified code implying a working path that does not exist, against a payload the SDK types as `any`. The endpoint itself is kept, typed against the SDK's own `FuturesFill`, and starts working the moment a key carries the permission.
 - Read-only `GET /accountFills` — executions on the ACCOUNT, newest first, distinct from `/trades` (the public tape for a symbol). Each fill carries the client order id the caller supplied, which is what makes it reconcilable: a fill the venue reports against one of our ids, for an order we recorded as cancelled-and-unfilled, is a fill we lost — provable per fill, with no argument from margin or position size, and a trade the user placed by hand drops out by construction because it carries no id of ours. Implemented for Kraken Futures (`getFills`, paged backwards via `since`); every other venue inherits the abstract default and returns an empty list rather than an error. Booked in the heavy rate-limit bucket alongside `getTradesHistory`, so walking account history competes with other history calls rather than with trading.
 
 ### Fixed
@@ -107,7 +490,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- A declared IP allowlist can now only ever prove the positive: a populated list answers `yes`, and empty, absent **or an explicit `*` wildcard** all answer `unknown`. 1.18.3 still treated `['*']` as the exchange affirmatively stating "any IP" and returned `no`. That was wrong, and measurably so — Bybit emits `['*']` rather than `[]`, so of 443 credentials re-probed after 1.18.3 shipped, **441 came back `no`**: the change accomplished nothing for the exchange that motivated it. A wildcard is not a claim that the key is unrestricted; it means the key's own allowlist is empty, which is equally true of a key bound through the connect-a-third-party-app flow where the binding lives on the exchange's side. Such keys report `['*']` and still reject calls from unpublished addresses. The cost is deliberate: `ipRestricted` is now effectively binary (`yes`/`unknown`) and no key can be declared unprotected from this field alone — establishing that requires the two-sided capability probe. Binance is unaffected and can still answer `no`, because it declares `ipRestrict` as an explicit boolean rather than an allowlist to be inferred from.
+- A declared IP allowlist can now only ever prove the positive: a populated list answers `yes`, and empty, absent **or an explicit `*` wildcard** all answer `unknown`. 1.18.3 still treated `['*']` as the exchange affirmatively stating "any IP" and returned `no`. That was wrong, and measurably so — Bybit emits `['*']` rather than `[]`, so re-probed credentials came back `no`: the change accomplished nothing for the exchange that motivated it. A wildcard is not a claim that the key is unrestricted; it means the key's own allowlist is empty, which is equally true of a key bound through the connect-a-third-party-app flow where the binding lives on the exchange's side. Such keys report `['*']` and still reject calls from unpublished addresses. The cost is deliberate: `ipRestricted` is now effectively binary (`yes`/`unknown`) and no key can be declared unprotected from this field alone — establishing that requires the two-sided capability probe. Binance is unaffected and can still answer `no`, because it declares `ipRestrict` as an explicit boolean rather than an allowlist to be inferred from.
 
 ## [1.18.3] - 2026-08-03
 
@@ -143,29 +526,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- OKX Europe X-Perp futures (instType=FUTURES, ruleType=xperp) on the okxLinear rail for okxSource=my: instFamily->instId symbol translation with expiry-roll cache, account-scoped `GET /exchange/account/futures` instrument endpoint, `okxsource` on `GET /exchange/all`, X-Perp candles/tickers/funding on keyless clients, and X-Perp tickers merged into the futures price list. Contributed by community member discord2020 (forum topic 4925).
+- OKX Europe X-Perp futures (instType=FUTURES, ruleType=xperp) on the okxLinear rail for okxSource=my: instFamily->instId symbol translation with expiry-roll cache, account-scoped `GET /exchange/account/futures` instrument endpoint, `okxsource` on `GET /exchange/all`, X-Perp candles/tickers/funding on keyless clients, and X-Perp tickers merged into the futures price list. Contributed by a community member.
 
 ## [1.16.9] - 2026-07-29
 
 ### Fixed
 
-- **Kraken: the public (per-IP) rate limit is now retried with backoff instead of failing instantly (bug #181).** Kraken returns its public-endpoint limit as HTTP **200** with `{"error":["EGeneral:Too many requests"]}` in the body, so it matched neither the spot/futures strings in `retryErrors` nor the numeric `httpStatus` entries — `shouldRetry` was always false. Every rejected `/public/OHLC` call returned `NOTOK` immediately and the market-archive backfiller simply re-requested, so the six-node egress fleet hammered Kraken continuously instead of riding the limit out: prod node 40 logged 142 of 145 error lines with this signature and **zero** `Retrying after` lines, leaving candle backfill gapped and burying every other error on those nodes. The code is now in `retryErrors` and gets the same slow rate-limit pacing (3 attempts, 30s apart) as `EAPI:Rate limit exceeded`. It deliberately does **not** trigger `noteRateLimited()`: that downgrades an *account's* private REST tier, and a per-IP public rejection says nothing about any account's private budget. Covered by `src/exchange/exchanges/kraken/rate-limit.spec.ts`.
+- **Kraken: the public (per-IP) rate limit is now retried with backoff instead of failing instantly.** Kraken returns its public-endpoint limit as HTTP **200** with `{"error":["EGeneral:Too many requests"]}` in the body, so it matched neither the spot/futures strings in `retryErrors` nor the numeric `httpStatus` entries — `shouldRetry` was always false. Every rejected `/public/OHLC` call returned `NOTOK` immediately and the market-archive backfiller simply re-requested, so the connector hammered Kraken continuously instead of riding the limit out: the rejection never produced a `Retrying after` line, leaving candle backfill gapped. The code is now in `retryErrors` and gets the same slow rate-limit pacing (3 attempts, 30s apart) as `EAPI:Rate limit exceeded`. It deliberately does **not** trigger `noteRateLimited()`: that downgrades an *account's* private REST tier, and a per-IP public rejection says nothing about any account's private budget. Covered by `src/exchange/exchanges/kraken/rate-limit.spec.ts`.
 
 ## [1.16.8] - 2026-07-29
 
 ### Added
 
-- **Kraken spot verify now rejects keys missing the "WebSocket interface" permission (issue #167 / ClickUp 86eyep5au).** Such a key passes the REST balance probe, so the connection looked healthy while the user-stream connector's `GetWebSocketsToken` call was rejected with `EGeneral:Permission denied` forever (16 users on 07-28) — the user was never told and their bots silently fell back to delayed reconcile-sweep-only fill delivery. `verifyKraken` now calls the new `Kraken.verifyWebsocketPermission()` (a `GetWebSocketsToken` probe) after the balance check and fails with a user-facing reason naming the exact Kraken setting to enable, following the Hyperliquid agent-address guard precedent. Only a definite `EGeneral:Permission denied` rejects; transient errors (rate limit, 5xx) never block verification. Spot-only — Kraken Futures WS auth signs a challenge with the key itself and has no separate permission.
+- **Kraken spot verify now rejects keys missing the "WebSocket interface" permission.** Such a key passes the REST balance probe, so the connection looked healthy while the user-stream connector's `GetWebSocketsToken` call was rejected with `EGeneral:Permission denied` forever — the user was never told and their bots silently fell back to delayed reconcile-sweep-only fill delivery. `verifyKraken` now calls the new `Kraken.verifyWebsocketPermission()` (a `GetWebSocketsToken` probe) after the balance check and fails with a user-facing reason naming the exact Kraken setting to enable, following the Hyperliquid agent-address guard precedent. Only a definite `EGeneral:Permission denied` rejects; transient errors (rate limit, 5xx) never block verification. Spot-only — Kraken Futures WS auth signs a challenge with the key itself and has no separate permission.
 
 ### Fixed
 
-- **Kraken: retries no longer re-invoke the method with garbled arguments.** `handleKrakenErrors` retries with `cb.call(this, ...args)`, but 19 call sites passed only the timeProfile — so any retryable Kraken error re-called the method with the TimeProfile object in the first parameter slot (`symbol`/`order`), surfacing as unhandled `TypeError: ourSymbol.replace is not a function` 500s (prod: `latestPrice` since June, `getCandles` on 2026-07-28 via WLFI-USD@krakenUsdm). Every call site now forwards the wrapped method's full argument list, matching the already-correct `getFundingRateHistory`/`futures_changeMarginType` sites.
+- **Kraken: retries no longer re-invoke the method with garbled arguments.** `handleKrakenErrors` retries with `cb.call(this, ...args)`, but 19 call sites passed only the timeProfile — so any retryable Kraken error re-called the method with the TimeProfile object in the first parameter slot (`symbol`/`order`), surfacing as unhandled `TypeError: ourSymbol.replace is not a function` 500s (seen on `latestPrice`, and on `getCandles` via WLFI-USD@krakenUsdm). Every call site now forwards the wrapped method's full argument list, matching the already-correct `getFundingRateHistory`/`futures_changeMarginType` sites.
 
 ## [1.16.6] - 2026-07-28
 
 ### Added
 
-- **`src/exchange/helpers/symbolCodec.ts` — the single home for pair-symbol format knowledge** (Phase 1 of the symbol-format cleanup behind bug #153). Defines the canonical dashed `BASE-QUOTE` form and the adapter contract: resolve wire symbols through the asset map in one place per adapter, never fabricate a wire symbol on a lookup miss (return `null` → one-attempt `NOTOK Unknown pair`), and pass already-wire symbols through unchanged. Fallback-on-miss is only permitted while the asset map itself is unavailable, so a transient refresh outage degrades instead of hard-failing.
+- **`src/exchange/helpers/symbolCodec.ts` — the single home for pair-symbol format knowledge** (Phase 1 of the symbol-format cleanup). Defines the canonical dashed `BASE-QUOTE` form and the adapter contract: resolve wire symbols through the asset map in one place per adapter, never fabricate a wire symbol on a lookup miss (return `null` → one-attempt `NOTOK Unknown pair`), and pass already-wire symbols through unchanged. Fallback-on-miss is only permitted while the asset map itself is unavailable, so a transient refresh outage degrades instead of hard-failing.
 
 ### Fixed
 
@@ -181,19 +564,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Kraken Futures: a partially- or fully-filled resting order is no longer reported as `NEW`, which was causing the bot to re-buy the same size at the same price (forum #4924).** Kraken Futures reports a resting order with a raw status of `ENTERED_BOOK` / `partiallyFilled` / `untouched` even when `filled > 0`. `getOrderStatus` (primary) and `getAllOpenOrders` passed that raw status straight into `mapOrderStatus`, which lacked the Futures statuses (only spot `"partially filled"` with a space existed) so everything fell through to `NEW`. main-app keys off `PARTIALLY_FILLED`/`FILLED`, so the fill was never recorded and the bot opened the position again. Both futures paths now derive the status from `executedQty` vs `origQty` via a new `futures_deriveOrderStatus` helper (mirroring the `getOrderEvents` fallback: a terminal cancel/reject wins, otherwise fill-derived), and `mapOrderStatus` gained the Futures raw statuses plus an idempotent `PARTIALLY_FILLED` mapping so a derived status survives the re-map in `futures_convertOrder`. Unit repro: `src/exchange/exchanges/kraken/partial-fill.spec.ts` (10 assertions).
+- **Kraken Futures: a partially- or fully-filled resting order is no longer reported as `NEW`, which was causing the bot to re-buy the same size at the same price.** Kraken Futures reports a resting order with a raw status of `ENTERED_BOOK` / `partiallyFilled` / `untouched` even when `filled > 0`. `getOrderStatus` (primary) and `getAllOpenOrders` passed that raw status straight into `mapOrderStatus`, which lacked the Futures statuses (only spot `"partially filled"` with a space existed) so everything fell through to `NEW`. main-app keys off `PARTIALLY_FILLED`/`FILLED`, so the fill was never recorded and the bot opened the position again. Both futures paths now derive the status from `executedQty` vs `origQty` via a new `futures_deriveOrderStatus` helper (mirroring the `getOrderEvents` fallback: a terminal cancel/reject wins, otherwise fill-derived), and `mapOrderStatus` gained the Futures raw statuses plus an idempotent `PARTIALLY_FILLED` mapping so a derived status survives the re-map in `futures_convertOrder`. Unit repro: `src/exchange/exchanges/kraken/partial-fill.spec.ts` (10 assertions).
 
 ## [1.16.1] - 2026-07-16
 
 ### Fixed
 
-- **Hyperliquid: a persistent `clearinghouseState` 429 no longer crashes the whole connector process.** When the short-TTL clearinghouseState cache is enabled (`HL_CH_STATE_CACHE_MS>0`, set to `1500` in prod), `HyperliquidChStateCache.track()` registered the in-flight fetch with `void p.finally(cleanup)`. `.finally()` returns a *new* promise that re-raises `p`'s rejection; that derived chain had no `.catch()`, so although the primary consumer (`await run` in `fetchClearinghouseState`, caught by the balance/positions fan-out) handled the error, the floating finally-chain surfaced it as an **unhandled rejection** — which Node ≥15 turns into a process exit. A sustained Hyperliquid rate-limit therefore killed the connector (pm2 auto-restarted it), cascading into main-app `balance … hyperliquidLinear` Internal Server Errors, `[Funding] NOTOK`, and market-archive backfill failures for that venue. The retry/backoff added in 1.15.x did not prevent this: it fires *before* the final rejection, and the crash came from the exhausted-retry rejection escaping via the un-caught finally-chain. `track()` now swallows the finally-chain rejection (`.finally(cleanup).catch(() => {})`); the real error is still handled by the awaiting consumer. Bug only manifests with the cache enabled (prod), which is why it never reproduced in local dev (cache defaults OFF).
+- **Hyperliquid: a persistent `clearinghouseState` 429 no longer crashes the whole connector process.** When the short-TTL clearinghouseState cache is enabled (`HL_CH_STATE_CACHE_MS>0`), `HyperliquidChStateCache.track()` registered the in-flight fetch with `void p.finally(cleanup)`. `.finally()` returns a *new* promise that re-raises `p`'s rejection; that derived chain had no `.catch()`, so although the primary consumer (`await run` in `fetchClearinghouseState`, caught by the balance/positions fan-out) handled the error, the floating finally-chain surfaced it as an **unhandled rejection** — which Node ≥15 turns into a process exit. A sustained Hyperliquid rate-limit therefore killed the connector process, which was then restarted automatically, cascading into main-app `balance … hyperliquidLinear` Internal Server Errors, `[Funding] NOTOK`, and market-archive backfill failures for that venue. The retry/backoff added in 1.15.x did not prevent this: it fires *before* the final rejection, and the crash came from the exhausted-retry rejection escaping via the un-caught finally-chain. `track()` now swallows the finally-chain rejection (`.finally(cleanup).catch(() => {})`); the real error is still handled by the awaiting consumer. Bug only manifests with the cache enabled, which is why it never reproduced in local dev (cache defaults OFF).
 
 ## [1.15.11] - 2026-07-15
 
 ### Changed
 
-- **Kraken: rate-limit rejections now retry 3x with 30s spacing instead of 10x with <=10s backoff.** `EAPI:Rate limit exceeded` / `apiLimitExceeded` shared the generic retry policy (10 attempts, exponential backoff capped at 10s), so under sustained per-account saturation every throttled call spawned up to 10 more requests while Kraken's counter only decays at ~0.33-0.5/s -- amplifying the storm (2026-07-14: ~2.3k logged rate-limit errors fleet-wide in 4h). Rate-limit-class errors now get at most 3 attempts spaced 30s apart (sized to the counter decay); all other retryable errors keep the existing policy. Retries still re-enter `checkLimits`, preserving local budget accounting.
+- **Kraken: rate-limit rejections now retry 3x with 30s spacing instead of 10x with <=10s backoff.** `EAPI:Rate limit exceeded` / `apiLimitExceeded` shared the generic retry policy (10 attempts, exponential backoff capped at 10s), so under sustained per-account saturation every throttled call spawned up to 10 more requests while Kraken's counter only decays at ~0.33-0.5/s -- amplifying the storm. Rate-limit-class errors now get at most 3 attempts spaced 30s apart (sized to the counter decay); all other retryable errors keep the existing policy. Retries still re-enter `checkLimits`, preserving local budget accounting.
 
 ## [1.15.10] - 2026-07-14
 
@@ -214,7 +597,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Bitget spot candle reads now page the recent `/spot/market/candles` endpoint at its documented max of 1000 candles/call (was 200), while `/spot/market/history-candles` stays correctly capped at 200. Each range read that stays inside the recent-lookback window now issues ~5x fewer upstream requests, which is the dominant driver of the `Bitget request must sleep` rate-limit churn in the connector fleet (getSpotCandles was the single largest source). Chunk striding in the mixed recent/historic path advances by the page size of the endpoint each chunk uses, so no bars are skipped. Futures candles are unchanged (they use the 200-capped history endpoint; raising them requires an endpoint switch, tracked separately).
+- Bitget spot candle reads now page the recent `/spot/market/candles` endpoint at its documented max of 1000 candles/call (was 200), while `/spot/market/history-candles` stays correctly capped at 200. Each range read that stays inside the recent-lookback window now issues ~5x fewer upstream requests, which is the dominant driver of the `Bitget request must sleep` rate-limit churn in the connector (getSpotCandles was the single largest source). Chunk striding in the mixed recent/historic path advances by the page size of the endpoint each chunk uses, so no bars are skipped. Futures candles are unchanged (they use the 200-capped history endpoint; raising them requires an endpoint switch, tracked separately).
 
 ## [1.15.7] - 2026-07-12
 
@@ -279,7 +662,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Kraken spot `getOrder` now resolves a Kraken order txid via QueryOrders (guarded by txid-format detection). main-app already translates our client id to the stored txid before polling Kraken order status (reconcile / checkOrdersAfterReconnect), but the connector could only look up by userref (`parseInt('O…',16)=NaN`), so that path never resolved — resting Kraken spot fills were never reconciled. This repairs the missed-fill reconcile backstop for Kraken (forum #4890); pairs with main-app preserving the local clientOrderId in the merge.
+- Kraken spot `getOrder` now resolves a Kraken order txid via QueryOrders (guarded by txid-format detection). main-app already translates our client id to the stored txid before polling Kraken order status (reconcile / checkOrdersAfterReconnect), but the connector could only look up by userref (`parseInt('O…',16)=NaN`), so that path never resolved — resting Kraken spot fills were never reconciled. This repairs the missed-fill reconcile backstop for Kraken; pairs with main-app preserving the local clientOrderId in the merge.
 
 ## [1.14.2] - 2026-07-06
 
@@ -291,7 +674,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Hyperliquid futures balance under-reported total equity. `futures_getBalance` derived `locked` from `marginSummary.totalMarginUsed` (open-position margin only), so `free + locked = withdrawable + positionMargin` omitted the collateral HL reserves for OPEN ORDERS — a leveraged account with deep resting grid/DCA ladders showed far less than its real `accountValue` (e.g. $13.9k for a $20.8k account). Derive `locked = accountValue - free` (free = `min(withdrawable, accountValue)`) so total equals `accountValue`; still clamps `locked >= 0` and collapses the anomalous non-primary `accountValue=0` dex-state to zero (no phantom balance).
+- Hyperliquid futures balance under-reported total equity. `futures_getBalance` derived `locked` from `marginSummary.totalMarginUsed` (open-position margin only), so `free + locked = withdrawable + positionMargin` omitted the collateral HL reserves for OPEN ORDERS — a leveraged account with deep resting grid/DCA ladders showed far less than its real `accountValue` (an account could show far less than its true account value). Derive `locked = accountValue - free` (free = `min(withdrawable, accountValue)`) so total equals `accountValue`; still clamps `locked >= 0` and collapses the anomalous non-primary `accountValue=0` dex-state to zero (no phantom balance).
 
 ## [1.14.0] - 2026-07-04
 
@@ -306,12 +689,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [1.13.4] - 2026-07-04
 
 ### Fixed
-- Hyperliquid `spot_getBalance` now clamps a negative spot `hold` to `0`. Hyperliquid can return a negative `hold` on spot-perp / builder-dex wallets (observed live: USDC `total=59953 hold=-85125`, USDT0 `total=0 hold=-89572`); the old `free = total - hold` inflated `free` by the absolute hold (USDC showed `145078` instead of the real `59953`, USDT a phantom `89572`) and `locked = hold` went negative. Now `locked = max(0, hold)` and `free = max(0, total - locked)`, so `free + locked === total` and neither value is phantom. This is the true source of the wrong Hyperliquid free/locked seen in the dashboard; the earlier `futures_getBalance` and main-app `normalizeLocked` fixes addressed the negative-`locked` symptom but not the inflated spot `free`.
+- Hyperliquid `spot_getBalance` now clamps a negative spot `hold` to `0`. Hyperliquid can return a negative `hold` on spot-perp / builder-dex wallets (observed live); the old `free = total - hold` inflated `free` by the absolute hold (a funded wallet's free balance read far above the real figure, and an empty one showed a phantom balance) and `locked = hold` went negative. Now `locked = max(0, hold)` and `free = max(0, total - locked)`, so `free + locked === total` and neither value is phantom. This is the true source of the wrong Hyperliquid free/locked seen in the dashboard; the earlier `futures_getBalance` and main-app `normalizeLocked` fixes addressed the negative-`locked` symptom but not the inflated spot `free`.
 
 ## [1.13.3] - 2026-07-04
 
 ### Fixed
-- Hyperliquid `futures_getBalance` now also bounds `free` by the dex-state's own value — `min(withdrawable, accountValue - locked)` — instead of the raw account-level `withdrawable`. Prevents a phantom balance (e.g. USDT `free=89568` on a state whose `accountValue=0`) from surfacing the account total under a non-primary collateral asset. No change for healthy single-collateral accounts where `withdrawable ≤ accountValue - marginUsed`.
+- Hyperliquid `futures_getBalance` now also bounds `free` by the dex-state's own value — `min(withdrawable, accountValue - locked)` — instead of the raw account-level `withdrawable`. Prevents a phantom balance (e.g. a phantom `free` on a state whose `accountValue=0`) from surfacing the account total under a non-primary collateral asset. No change for healthy single-collateral accounts where `withdrawable ≤ accountValue - marginUsed`.
 
 ## [1.13.2] - 2026-07-04
 
@@ -331,7 +714,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Hyperliquid: spot balances now reconcile to the pair base (`UBTC` wallet asset → `BTC`), so SELL side and bot funds no longer read 0 for spot holdings (forum #4860), for every Unit token — not just BTC.
+- Hyperliquid: spot balances now reconcile to the pair base (`UBTC` wallet asset → `BTC`), so SELL side and bot funds no longer read 0 for spot holdings, for every Unit token — not just BTC.
 
 ### Removed
 

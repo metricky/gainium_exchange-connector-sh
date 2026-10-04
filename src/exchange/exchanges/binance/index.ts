@@ -5,6 +5,7 @@ import {
   FuturesCoinMAccountInformation,
   FuturesAccountAsset,
   OrderResponseResult,
+  OrderResponseFull,
   NewSpotOrderParams,
   NewFuturesOrderParams,
   NewOrderResult,
@@ -21,6 +22,7 @@ import {
 } from 'binance'
 import { USDMClient, CoinMClient, MainClient } from '../../../binance-custom'
 import limitHelper from './limit'
+import { normalizeOrderFees } from '../../helpers/orderFee'
 import {
   BaseReturn,
   CandleResponse,
@@ -58,6 +60,22 @@ import {
 } from '../../helpers/keyPermissions'
 import { Logger } from '@nestjs/common'
 import { sleep } from '../../../utils/sleepUtils'
+import { safeStringify } from '../../../utils/redact'
+import { keyFingerprint } from '../../../utils/keyFingerprint'
+import { pageCandleRange } from '../../helpers/candlePager'
+import { timeIntervalMap } from '../okx'
+
+/**
+ * Most bars one `/klines` call serves. MEASURED against the live API
+ * (spec 024 §2.2): spot clamps an over-ask to 1000 silently — `limit=1500`
+ * returns 1000 rows, HTTP 200 — while `fapi`/`dapi` really do serve 1500.
+ *
+ * These are page sizes for the pager only. The single-call paths keep sending
+ * `countData || 1000`: that is a caller's page size, not this cap, and every
+ * caller that passes a count relies on getting exactly what it asked for.
+ */
+const SPOT_CANDLE_PAGE_SIZE = 1000
+const FUTURES_CANDLE_PAGE_SIZE = 1500
 
 export enum HttpMethod {
   GET = 'GET',
@@ -97,6 +115,53 @@ function binanceFuturesAssetClass(
       return 'commodity'
     default:
       return undefined
+  }
+}
+
+/**
+ * Render a thrown Binance error as a human string.
+ *
+ * The SDK's `parseException` does not throw an Error. On any non-2xx it throws
+ * a PLAIN OBJECT shaped `{ code, message, body, headers, requestUrl,
+ * requestBody, requestOptions }`, where `message` is `response.data?.msg` --
+ * i.e. UNDEFINED whenever the venue's error body is not Binance's own
+ * `{code,msg}` JSON. `body` is then the parsed response payload, which for a
+ * JSON error page is an object.
+ *
+ * The previous ladder interpolated that object directly, so every such failure
+ * reduced to the literal string "[object Object]" -- carried through the
+ * connector's `reason`, the balancer and main-app into the user-visible bot
+ * error, destroying the only diagnostic the response had. The US domain is
+ * hit hardest because it routes through the raw `getPrivate()` call, whose
+ * upstream failures (proxy and CDN error pages) are exactly the ones that
+ * carry no `msg`.
+ *
+ * Strings pass through untouched, so existing message matching is unaffected.
+ * Non-strings go through `safeStringify`, never `JSON.stringify`: a thrown
+ * exchange error has the failing request stapled to it, and the redaction the
+ * SDKs advertise is not the redaction you get.
+ */
+export const describeBinanceError = (e: unknown): string => {
+  const render = (v: unknown): string =>
+    typeof v === 'string' ? v : safeStringify(v)
+  try {
+    const err = e as { message?: unknown; body?: unknown } | null
+    if (err && err.message != null && err.message !== '') {
+      return render(err.message)
+    }
+    if (err && err.body != null && err.body !== '') {
+      return render(err.body)
+    }
+    if (typeof e === 'string') {
+      return e
+    }
+    if (e instanceof Error) {
+      return e.message
+    }
+    return safeStringify(e)
+  } catch {
+    // Never let diagnostics throw inside an error path.
+    return '<unrenderable exchange error>'
   }
 }
 
@@ -580,17 +645,7 @@ class BinanceExchange extends AbstractExchange implements Exchange {
   }
   override returnBad(timeProfile: TimeProfile, usage = limitHelper.getUsage()) {
     return (e: Error) => {
-      let msg = ''
-      try {
-        msg =
-          'message' in e && e.message
-            ? `${e.message}`
-            : 'body' in e && e.body
-              ? `${e.body}`
-              : `${e}`
-      } catch {
-        msg = `${e}`
-      }
+      const msg = describeBinanceError(e)
       return {
         status: StatusEnum.notok as StatusEnum.notok,
         reason: msg,
@@ -748,8 +803,7 @@ class BinanceExchange extends AbstractExchange implements Exchange {
       timeProfile
     const { symbol, side, quantity, price, newClientOrderId, type } = order
     let orderData:
-      | NewSpotOrderParams<'LIMIT', 'RESULT'>
-      | NewSpotOrderParams<'MARKET', 'RESULT'>
+      NewSpotOrderParams<'LIMIT', 'FULL'> | NewSpotOrderParams<'MARKET', 'FULL'>
     {
       orderData = {
         symbol,
@@ -773,8 +827,17 @@ class BinanceExchange extends AbstractExchange implements Exchange {
       }
     }
     timeProfile = this.startProfilerTime(timeProfile, 'exchange')
+    // FULL rather than RESULT: it is the only Binance spot response that
+    // carries `fills[]`, and each fill states the fee Binance actually took
+    // (`commission` + `commissionAsset`). Binance charges the same request
+    // weight for ACK, RESULT and FULL, so this observation is free — it was
+    // simply never asked for. It covers every order that trades at placement;
+    // an order that rests and fills later reports its commission on the user
+    // data stream instead (`executionReport.n`/`N`), which is where main-app
+    // picks it up, because neither `GET /api/v3/order` nor the futures order
+    // endpoint returns a fee at all.
     return this.client
-      .submitNewOrder({ ...orderData, newOrderRespType: 'RESULT' })
+      .submitNewOrder({ ...orderData, newOrderRespType: 'FULL' })
       .then((res) => {
         timeProfile = this.endProfilerTime(timeProfile, 'exchange')
         return this.convertOrder(res)
@@ -1179,7 +1242,13 @@ class BinanceExchange extends AbstractExchange implements Exchange {
     return this.client
       .cancelOrder({
         symbol,
-        orderId: +orderId,
+        // Sent as the caller's string, NOT `+orderId`: a venue order id above 2^53
+        // does not survive a JS number round trip, so the `+` addressed a different
+        // order than the one we were asked to cancel (spec 004 §4.7). The SDK
+        // serialises the param into the query string either way, and the id-format
+        // check that would reject a string is already disabled in
+        // `binance-custom` (`validateOrderId`).
+        orderId: orderId as unknown as number,
       })
       .then((res) => {
         timeProfile = this.endProfilerTime(timeProfile, 'exchange')
@@ -1222,7 +1291,9 @@ class BinanceExchange extends AbstractExchange implements Exchange {
     const { symbol, orderId } = order
     const input = {
       symbol,
-      orderId: +orderId,
+      // See the note in `cancelOrderByOrderIdAndSymbol` — the caller's id goes to
+      // the venue verbatim so a >2^53 futures id is not rounded onto another order.
+      orderId: orderId as unknown as number,
       recvWindow: this.recvWindow,
     }
     timeProfile = this.startProfilerTime(timeProfile, 'exchange')
@@ -2152,6 +2223,66 @@ class BinanceExchange extends AbstractExchange implements Exchange {
     if (!this.client) {
       return this.errorClient(timeProfile)
     }
+    // A range read with no explicit count walks the venue until the window is
+    // covered. Without this the single call below returns one page — the
+    // OLDEST 1000 bars, because `/api/v3/klines` anchors at `startTime` — for
+    // any range, silently (bug #923, spec 024).
+    //
+    // `from`/`to` are typed `number` and are NOT numbers at runtime (spec 023
+    // §2.1: `@Query` with no transforming pipe). Nothing here used to ADD to
+    // them, which is why this adapter never had #921's concatenation; the
+    // pager does, so they are coerced into locals. Locals, not reassignment:
+    // the single-call path below keeps passing exactly what it passes today.
+    const fromMs = from == null ? from : +from
+    const toMs = to == null ? to : +to
+    const step = timeIntervalMap[interval]
+    if (fromMs && toMs && !countData && step > 0 && toMs > fromMs) {
+      try {
+        const candles = await pageCandleRange({
+          from: fromMs,
+          to: toMs,
+          step,
+          pageSize: SPOT_CANDLE_PAGE_SIZE,
+          fetchPage: async (start, end, limit) => {
+            timeProfile =
+              (await this.checkLimits(
+                'getCandles',
+                'request',
+                this.isNewLimit ? 2 : 1,
+                timeProfile,
+              )) || timeProfile
+            timeProfile = this.startProfilerTime(timeProfile, 'exchange')
+            const res = await this.client.getKlines({
+              symbol,
+              interval,
+              startTime: start,
+              endTime: end,
+              limit,
+            })
+            timeProfile = this.endProfilerTime(timeProfile, 'exchange')
+            return res.map((k) => ({
+              open: `${k[1]}`,
+              close: `${k[4]}`,
+              high: `${k[2]}`,
+              low: `${k[3]}`,
+              time: k[0],
+              volume: `${k[5]}`,
+            }))
+          },
+        })
+        return this.returnGood<CandleResponse[]>(timeProfile)(candles)
+      } catch (e) {
+        return this.handleBinanceErrors(
+          this.spot_getCandles,
+          symbol,
+          interval,
+          from,
+          to,
+          countData,
+          this.endProfilerTime(timeProfile, 'exchange'),
+        )(e)
+      }
+    }
     timeProfile =
       (await this.checkLimits(
         'getCandles',
@@ -2240,77 +2371,104 @@ class BinanceExchange extends AbstractExchange implements Exchange {
             ? 5
             : 10
       : 5
-    if (this.coinm) {
-      if (
-        options.startTime &&
-        options.endTime &&
-        options.endTime - options.startTime > 200 * 24 * 60 * 60 * 1000
-      ) {
-        const candles: CandleResponse[] = []
-
-        for (
-          let start = options.startTime;
-          start < options.endTime;
-          start += 200 * 24 * 60 * 60 * 1000
-        ) {
-          const end = Math.min(
-            start + 200 * 24 * 60 * 60 * 1000,
-            options.endTime,
-          )
-          timeProfile =
-            (await this.checkLimits(
-              'futures_getCandles',
-              'request',
-              limit,
-              timeProfile,
-            )) || timeProfile
-          timeProfile = this.startProfilerTime(timeProfile, 'exchange')
-          if (timeProfile.inQueueStartTime && timeProfile.inQueueEndTime) {
-            const diff =
-              timeProfile.inQueueEndTime - timeProfile.inQueueStartTime
-            if (diff >= this.timeout) {
-              Logger.error(
-                `BINANCE Queue time is too long ${diff / 1000} futures_getCandles ${
-                  this.usdm ? 'usdm' : 'coinm'
-                }`,
-              )
-              return this.returnBad(timeProfile)(new Error('Response timeout'))
+    // A range read with no explicit count walks the venue until the window is
+    // covered — one call returns the OLDEST page and nothing says so (bug
+    // #923, spec 024).
+    // `from`/`to` are query strings at runtime (spec 023 §2.1) and the pager
+    // is the first code here to ADD to them; the rest of this method already
+    // coerces with unary `+` at each use, as it always has.
+    const fromMs = from == null ? from : +from
+    const toMs = to == null ? to : +to
+    const step = timeIntervalMap[interval]
+    // COIN-M has ALWAYS walked a window wider than 200 days rather than
+    // serving one page of `countData` — but in a loop of its own that asked
+    // `this.client`, the SPOT `MainClient` (:224), instead of the `client`
+    // resolved above for the market. `api.binance.com` does not list
+    // `BTCUSD_PERP`, so every chunk came back `-1121 Invalid symbol`, the
+    // `.catch` resolved a `BaseReturn` into a `for` body where nothing read
+    // it, and the method reported the empty accumulator as `status: OK`
+    // (bug #925, spec 026). Routing that window through the same pager keeps
+    // the branch's intent and fixes all three: the right client, chunks by BAR
+    // COUNT instead of a flat 200 days (a 200-day `1h` chunk is 4800 bars
+    // against a 1500-row cap), and a throw that reaches `handleBinanceErrors`.
+    // The 200-day trigger is deliberately unchanged, so a narrower COIN-M
+    // window still takes the single call below exactly as it does today, and
+    // `binanceUsdm`/spot never satisfy `this.coinm` at all.
+    const coinmWideRange =
+      this.coinm &&
+      !!fromMs &&
+      !!toMs &&
+      toMs - fromMs > 200 * 24 * 60 * 60 * 1000
+    if (
+      fromMs &&
+      toMs &&
+      step > 0 &&
+      toMs > fromMs &&
+      (!countData || coinmWideRange)
+    ) {
+      try {
+        const candles = await pageCandleRange({
+          from: fromMs,
+          to: toMs,
+          step,
+          pageSize: FUTURES_CANDLE_PAGE_SIZE,
+          fetchPage: async (start, end, pageLimit) => {
+            timeProfile =
+              (await this.checkLimits(
+                'futures_getCandles',
+                'request',
+                limit,
+                timeProfile,
+              )) || timeProfile
+            timeProfile = this.startProfilerTime(timeProfile, 'exchange')
+            // The bail-out the COIN-M loop carried: once the rate-limit queue
+            // has already eaten the whole timeout, the request is pointless.
+            // Scoped to the window that loop owned so the paths #923 added
+            // keep the behaviour they shipped with. The throw becomes the same
+            // `notok`/`Response timeout` the loop returned, via the `catch`.
+            if (
+              coinmWideRange &&
+              timeProfile.inQueueStartTime &&
+              timeProfile.inQueueEndTime
+            ) {
+              const diff =
+                timeProfile.inQueueEndTime - timeProfile.inQueueStartTime
+              if (diff >= this.timeout) {
+                Logger.error(
+                  `BINANCE Queue time is too long ${diff / 1000} futures_getCandles coinm`,
+                )
+                throw new Error('Response timeout')
+              }
             }
-          }
-          await this.client
-            .getKlines({
-              ...options,
+            const res = await client.getKlines({
+              symbol,
+              interval,
               startTime: start,
               endTime: end,
+              limit: pageLimit,
             })
-            .then((res) => {
-              timeProfile = this.endProfilerTime(timeProfile, 'exchange')
-              candles.push(
-                ...res.map((k) => ({
-                  open: `${k[1]}`,
-                  close: `${k[4]}`,
-                  high: `${k[2]}`,
-                  low: `${k[3]}`,
-                  time: k[0],
-                  volume: `${k[5]}`,
-                })),
-              )
-            })
-            .catch(
-              this.handleBinanceErrors(
-                this.futures_getCandles,
-                symbol,
-                interval,
-                from,
-                to,
-                countData,
-                this.endProfilerTime(timeProfile, 'exchange'),
-              ),
-            )
-          await sleep(0)
-        }
-
+            timeProfile = this.endProfilerTime(timeProfile, 'exchange')
+            return res.map((k) => ({
+              open: `${k[1]}`,
+              close: `${k[4]}`,
+              high: `${k[2]}`,
+              low: `${k[3]}`,
+              time: k[0],
+              volume: `${k[5]}`,
+            }))
+          },
+        })
         return this.returnGood<CandleResponse[]>(timeProfile)(candles)
+      } catch (e) {
+        return this.handleBinanceErrors(
+          this.futures_getCandles,
+          symbol,
+          interval,
+          from,
+          to,
+          countData,
+          this.endProfilerTime(timeProfile, 'exchange'),
+        )(e)
       }
     }
 
@@ -2976,17 +3134,7 @@ class BinanceExchange extends AbstractExchange implements Exchange {
         'Request throttled by system-level protection'.toLowerCase()
       const html500 = '500 internal server error'
       const timeProfile: TimeProfile = args[args.length - 1]
-      let msg = ''
-      try {
-        msg =
-          'message' in e && e.message
-            ? `${e.message}`
-            : 'body' in e && e.body
-              ? `${e.body}`
-              : `${e}`
-      } catch {
-        msg = `${e}`
-      }
+      const msg = describeBinanceError(e)
       if (
         this.retryErrors.includes(e.code || 0) ||
         e.response ||
@@ -3045,7 +3193,9 @@ class BinanceExchange extends AbstractExchange implements Exchange {
           }
           if (e.code === -1015) {
             const time = this.coinm ? 61000 : 11000
-            Logger.warn(`Too many new order ${this.key}, sleep ${time / 1000}s`)
+            Logger.warn(
+              `Too many new order key#${keyFingerprint(this.key)}, sleep ${time / 1000}s`,
+            )
             await sleep(time)
           }
           if (e.code === -1008) {
@@ -3149,7 +3299,9 @@ class BinanceExchange extends AbstractExchange implements Exchange {
    * @param {Order} order to convert
    * @returns {CommonOrder} Common order result
    */
-  private convertOrder(order: SpotOrder | OrderResponseResult): CommonOrder {
+  private convertOrder(
+    order: SpotOrder | OrderResponseResult | OrderResponseFull,
+  ): CommonOrder {
     const orderStatus = (status: OrderStatus): OrderStatusType => {
       if (
         status === 'FILLED' ||
@@ -3167,7 +3319,20 @@ class BinanceExchange extends AbstractExchange implements Exchange {
       }
       return 'MARKET'
     }
+    // Binance states the fee per FILL, never on the order: `GET /api/v3/order`
+    // and the futures order endpoint carry no commission field whatsoever, so
+    // a FULL placement response is the only order-scoped place it appears.
+    // Each fill names its own `commissionAsset`, which is load-bearing rather
+    // than decorative — an account with "pay fees in BNB" enabled is charged
+    // in BNB, which is neither side of the traded pair, and a single order can
+    // straddle two fee assets when the BNB balance runs out mid-fill.
+    const fills =
+      'fills' in order && Array.isArray(order.fills) ? order.fills : []
+    const fee = normalizeOrderFees(
+      fills.map((f) => ({ amount: f.commission, asset: f.commissionAsset })),
+    )
     return {
+      ...fee,
       symbol: order.symbol,
       orderId: `${order.orderId}`,
       clientOrderId: order.clientOrderId,
@@ -3186,7 +3351,16 @@ class BinanceExchange extends AbstractExchange implements Exchange {
       status: orderStatus(order.status),
       type: orderType(order.type),
       side: order.side,
-      fills: [],
+      fills: fills.map((f, i) => ({
+        price: `${f.price}`,
+        qty: `${f.qty}`,
+        commission: `${f.commission}`,
+        commissionAsset: f.commissionAsset,
+        // Binance's spot FULL response omits `tradeId` on the fill; the index
+        // keeps the entries distinguishable without inventing an id that
+        // looks like the venue's.
+        tradeId: `${order.orderId}-${i}`,
+      })),
     }
   }
 
@@ -3210,6 +3384,14 @@ class BinanceExchange extends AbstractExchange implements Exchange {
       }
       return 'MARKET'
     }
+    // No fee fields here on purpose. Binance USD-M/COIN-M return no
+    // commission on either the placement response or `GET /fapi/v1/order` —
+    // the only order-scoped sources are `userTrades` (an extra weighted
+    // request per order) and the `ORDER_TRADE_UPDATE` user-stream event, which
+    // already carries `commission`/`commissionAsset` all the way into main-app
+    // and is where futures fees are captured. Emitting a 0 here would be worse
+    // than emitting nothing: the caller would book a free fill instead of
+    // keeping its estimate.
     return {
       positionSide: order.positionSide,
       reduceOnly: order.reduceOnly,

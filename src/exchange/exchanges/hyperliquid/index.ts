@@ -25,6 +25,7 @@ import {
   KeyPermissions,
 } from '../../types'
 import * as hl from '@nktkas/hyperliquid'
+import { normalizeOrderFees, type OrderFeeFields } from '../../helpers/orderFee'
 import { getWalletAddress } from '@nktkas/hyperliquid/signing'
 import { unknownPermissions } from '../../helpers/keyPermissions'
 import limitHelper from './limit'
@@ -972,6 +973,50 @@ const hlStateHasActivity = (state: unknown): boolean => {
 }
 
 /**
+ * Hyperliquid account abstraction modes whose collateral lives in the SPOT
+ * clearinghouse. Per HL's docs: "unified account and portfolio margin show all
+ * balances and holds in the spot clearinghouse state. Individual perp dex user
+ * states are not meaningful." — so `clearinghouseState` reads accountValue=0 /
+ * withdrawable=0 for these wallets even when they hold funds, and a perps
+ * balance built from it shows an empty account.
+ */
+export const HL_SPOT_COLLATERAL_MODES = new Set([
+  'unifiedAccount',
+  'portfolioMargin',
+])
+
+/** Per-wallet `userAbstraction` cache. Users can switch mode in the HL UI, so
+ *  the entry expires; a failed lookup is not cached. */
+const HL_ABSTRACTION_TTL_MS = 5 * 60 * 1000
+const hlAbstractionCache = new Map<string, { mode: string; at: number }>()
+
+/**
+ * Perps balance for a unified / portfolio-margin wallet, from its spot
+ * clearinghouse state: one entry per perps collateral asset. `hold` is the
+ * amount HL reserves (cross margin + open orders), so free = total - hold.
+ */
+export const hlUnifiedPerpBalance = (
+  balances: Array<{ coin: string; total: string; hold: string }>,
+  collateral: Set<string>,
+  alias: (coin: string) => string,
+): FreeAsset => {
+  const totals = new Map<string, { free: number; locked: number }>()
+  for (const b of balances) {
+    const asset = alias(b.coin)
+    if (!collateral.has(asset)) continue
+    const locked = Math.max(0, +b.hold || 0)
+    const free = Math.max(0, (+b.total || 0) - locked)
+    const cur = totals.get(asset) ?? { free: 0, locked: 0 }
+    cur.free += free
+    cur.locked += locked
+    totals.set(asset, cur)
+  }
+  const res: FreeAsset = []
+  totals.forEach((v, asset) => res.push({ asset, ...v }))
+  return res
+}
+
+/**
  * Classify an HL info-endpoint error for retry decisions.
  *
  * 422 "Failed to deserialize the JSON body into the target type" is HL
@@ -1017,6 +1062,55 @@ const hlAddressLooksValid = (key: unknown): boolean =>
 
 /** Marker for "this connection can never talk to HL as configured". */
 const HL_BAD_ADDRESS_CODE = 4220
+
+/**
+ * The SDK's own rejection when the `wallet` it was handed is none of the four
+ * shapes it understands (viem account, ethers v5/v6 signer, or a secp256k1
+ * private-key string). Lowercased because `handleHyperliquidErrors` lowercases
+ * every message before it leaves the connector — this is the exact substring
+ * that reaches bot logs and the bot-error rules that match on them, so it must
+ * stay verbatim inside whatever text we return.
+ *
+ * @see https://github.com/nktkas/hyperliquid — `signing/_signTypedData/mod.ts`
+ */
+const HL_UNSUPPORTED_WALLET = 'unsupported wallet for signing typed data'
+
+/**
+ * What the user must go and paste, said once and reused everywhere.
+ *
+ * Kept short on purpose: main-app truncates a quoted connector reason at 300
+ * characters (`core/src/exchange/verifyFailureMessage.ts`), and the actionable
+ * half must survive that.
+ */
+const HL_SIGNING_KEY_HELP =
+  `Enter the 64-character private key shown when you created the ` +
+  `Hyperliquid API wallet, with no spaces or line breaks — not your wallet ` +
+  `address and not your seed phrase.`
+
+/**
+ * A Hyperliquid credential is a raw secp256k1 private key, and the SDK accepts
+ * it only as `0x` + 64 hex (or bare 64 hex). Everything else — a trailing
+ * newline from a password manager, a wrapped paste, an uppercase `0X` prefix —
+ * makes it fall through every branch of the SDK's wallet dispatch and throw
+ * {@link HL_UNSUPPORTED_WALLET} at *signing* time only.
+ *
+ * That is the worst possible place to find out: info requests (balance,
+ * positions, open orders) never sign, so the connection verifies fine and
+ * looks healthy, and the credential fails for the first time when a live bot
+ * tries to place, cancel or set leverage (Claus #551).
+ *
+ * So normalize the shapes that are a valid key wearing extra characters:
+ * strip all whitespace and re-prefix a `0x`/`0X`/bare 64-hex body. Anything
+ * that is not 64 hex characters underneath is returned trimmed and unchanged —
+ * it is not a key, and quietly reshaping it would only move the failure.
+ */
+const HL_PRIVATE_KEY_RE = /^(?:0[xX])?([0-9a-fA-F]{64})$/
+const normalizeHlPrivateKey = (secret: unknown): string => {
+  const raw = `${secret ?? ''}`
+  const compact = raw.replace(/\s+/g, '')
+  const m = HL_PRIVATE_KEY_RE.exec(compact)
+  return m ? `0x${m[1]}` : raw.trim()
+}
 
 /** Best-effort Retry-After (ms) from an HL 429, capped so we never stall long. */
 const hlRetryAfterMs = (err: unknown): number | undefined => {
@@ -1235,6 +1329,8 @@ class HyperliquidExchange extends AbstractExchange implements Exchange {
   protected futures?: Futures
   private demo = process.env.HYPERLIQUIDENV === 'demo'
   private code?: string
+  /** {@link normalizeHlPrivateKey} of `secret` — what actually signs. */
+  private signingKey: string
   constructor(
     futures: Futures,
     key: string,
@@ -1247,18 +1343,22 @@ class HyperliquidExchange extends AbstractExchange implements Exchange {
     _subaccount?: boolean,
   ) {
     super({ key, secret, passphrase, subaccount: `${_subaccount}` === 'true' })
+    // A key wearing whitespace or an uppercase `0X` is a valid key the SDK
+    // cannot see; normalize once here so every signer built from this instance
+    // (and the nonce bucket keyed off it) agrees. See normalizeHlPrivateKey.
+    this.signingKey = normalizeHlPrivateKey(secret)
     this.infoClient = new hl.InfoClient({
       transport: new hl.HttpTransport({ isTestnet: this.demo }),
     })
     this.exchangeClient = new hl.ExchangeClient({
       transport: new hl.HttpTransport({ isTestnet: this.demo }),
-      wallet: this.secret as `0x${string}`,
+      wallet: this.signingKey as `0x${string}`,
       isTestnet: this.demo,
       // Per-signer monotonic nonce shared across all in-process clients. The SDK
       // default is per-client, but this connector builds a fresh client per
       // request, so concurrent same-signer actions would otherwise collide on
       // the same Date.now() nonce → "duplicate nonce". See ./nonce.ts.
-      nonceManager: makeSharedNonce(this.secret as string),
+      nonceManager: makeSharedNonce(this.signingKey),
     })
     this.retry = 10
     this.retryErrors = ['429']
@@ -1331,6 +1431,42 @@ class HyperliquidExchange extends AbstractExchange implements Exchange {
   }
 
   /**
+   * Can the stored secret actually sign? Answered with the SDK's own
+   * `getWalletAddress`, i.e. the exact dispatch that decides whether an order
+   * gets signed or throws {@link HL_UNSUPPORTED_WALLET} — so this cannot drift
+   * from runtime behaviour.
+   *
+   * Verification never used to touch the secret at all: `getAccountRole` and
+   * `getBalance` are *info* requests keyed on the public address, so a
+   * credential that could never sign anything verified green and then failed
+   * on every order, cancel and leverage change a live bot attempted
+   * (Claus #551 — five DCA bots on one connection, all three call classes).
+   * Failing here instead turns a permanent, silent trading outage into a
+   * rejected connection with an instruction.
+   */
+  async checkSigningKey(): Promise<{ ok: boolean; reason?: string }> {
+    if (!`${this.secret ?? ''}`.trim()) {
+      return {
+        ok: false,
+        reason: `Hyperliquid API wallet private key is missing. ${HL_SIGNING_KEY_HELP}`,
+      }
+    }
+    try {
+      await getWalletAddress(this.signingKey as `0x${string}`)
+      return { ok: true }
+    } catch {
+      // Deliberately quotes the SDK's own wording so this reads as the same
+      // fault as the runtime failure it prevents (and matches the same rule).
+      return {
+        ok: false,
+        reason:
+          `This Hyperliquid API wallet private key cannot sign ` +
+          `(${HL_UNSUPPORTED_WALLET}). ${HL_SIGNING_KEY_HELP}`,
+      }
+    }
+  }
+
+  /**
    * Hyperliquid account role for this connection's address, per HL's own
    * `userRole`. Used at verify time to catch the common onboarding mistake of
    * pasting an **API/agent wallet** address in place of the main account:
@@ -1376,7 +1512,7 @@ class HyperliquidExchange extends AbstractExchange implements Exchange {
   override async getKeyPermissions(): Promise<KeyPermissions> {
     let signer: string
     try {
-      signer = await getWalletAddress(this.secret as `0x${string}`)
+      signer = await getWalletAddress(this.signingKey as `0x${string}`)
     } catch (e) {
       return unknownPermissions(
         `Hyperliquid signer address underivable: ${(e as Error)?.message ?? e}`,
@@ -1635,11 +1771,88 @@ class HyperliquidExchange extends AbstractExchange implements Exchange {
     }
   }
 
+  /**
+   * This wallet's HL account abstraction mode (`unifiedAccount`,
+   * `portfolioMargin`, `default`, `dexAbstraction`, …) or `null` when the
+   * lookup fails — callers then fall back to the per-dex perps state.
+   */
+  private async getAccountAbstraction(): Promise<string | null> {
+    const cached = hlAbstractionCache.get(this._key)
+    if (cached && Date.now() - cached.at < HL_ABSTRACTION_TTL_MS) {
+      return cached.mode
+    }
+    try {
+      await this.checkLimits('userAbstraction', 20)
+      const mode = await this.infoClient.transport.request('info', {
+        type: 'userAbstraction',
+        user: this._key,
+      })
+      if (typeof mode !== 'string') return null
+      hlAbstractionCache.set(this._key, { mode, at: Date.now() })
+      return mode
+    } catch (e) {
+      Logger.warn(
+        `Hyperliquid userAbstraction failed for ${
+          typeof this._key === 'string' ? this._key.slice(0, 10) : '<unset>'
+        }…: ${(e as Error)?.message ?? e}`,
+      )
+      return null
+    }
+  }
+
+  /**
+   * Unified / portfolio-margin wallets keep every balance in the spot
+   * clearinghouse, so the spot and perps legs read the same money (see
+   * {@link HL_SPOT_COLLATERAL_MODES}). `null` when the lookup failed.
+   */
+  async getSharedWallet(): Promise<BaseReturn<boolean | null>> {
+    const mode = await this.getAccountAbstraction()
+    return this.returnGood<boolean | null>(this.getEmptyTimeProfile())(
+      mode === null ? null : HL_SPOT_COLLATERAL_MODES.has(mode),
+    )
+  }
+
+  /** Perps balance for a unified / portfolio-margin wallet (see
+   *  {@link HL_SPOT_COLLATERAL_MODES}). */
+  private async futures_getUnifiedBalance(
+    timeProfile: TimeProfile,
+  ): Promise<BaseReturn<FreeAsset>> {
+    try {
+      const assetsCache = HyperliquidAssets.getInstance()
+      await assetsCache.ensureSpotAssets()
+      // Collateral = HL native USDC + every builder dex's quote token.
+      const collateral = new Set<string>(['USDC'])
+      for (const a of await assetsCache.listFuturesAssets()) {
+        if (a.quoteAsset) collateral.add(aliasToken(a.quoteAsset))
+      }
+      timeProfile =
+        (await this.checkLimits('getSpotClearinghouseState', 2, timeProfile)) ||
+        timeProfile
+      timeProfile = this.startProfilerTime(timeProfile, 'exchange')
+      const get = await this.infoClient.spotClearinghouseState({
+        user: this._key,
+      })
+      timeProfile = this.endProfilerTime(timeProfile, 'exchange')
+      return this.returnGood<FreeAsset>(timeProfile)(
+        hlUnifiedPerpBalance(get.balances, collateral, aliasToken),
+      )
+    } catch (e) {
+      return this.handleHyperliquidErrors(
+        this.futures_getBalance,
+        this.endProfilerTime(timeProfile, 'exchange'),
+      )(new HyperliquidError(e?.body?.msg ?? e.message, 0))
+    }
+  }
+
   async futures_getBalance(
     timeProfile = this.getEmptyTimeProfile(),
   ): Promise<BaseReturn<FreeAsset>> {
     if (!this.futures) {
       return this.errorFutures(timeProfile)
+    }
+    const mode = await this.getAccountAbstraction()
+    if (mode && HL_SPOT_COLLATERAL_MODES.has(mode)) {
+      return this.futures_getUnifiedBalance(timeProfile)
     }
     const res: FreeAsset = []
     try {
@@ -1979,6 +2192,7 @@ class HyperliquidExchange extends AbstractExchange implements Exchange {
         return this.returnBad(timeProfile)(new Error('Response timeout'))
       }
     }
+    let fee: OrderFeeFields | undefined
     return this.infoClient
       .orderStatus({
         user: this._key,
@@ -2041,6 +2255,20 @@ class HyperliquidExchange extends AbstractExchange implements Exchange {
                 `Calculated price for order ${data.newClientOrderId} based on fills: ${price}`,
               )
               result.order.order.limitPx = price
+              // Same fills, second observation we were discarding: each one
+              // carries the fee Hyperliquid actually took (`fee`, negative for
+              // a maker rebate) and the token it took it in (`feeToken`, USDC
+              // for perps but not universally). This costs no extra request —
+              // the fills were already fetched above for the price.
+              // `feeToken` is HL's raw token name (UAVAX); alias it to the
+              // ticker the pair is listed under (AVAX), or consumers can't
+              // tell a base-asset fee from a third-asset one.
+              fee = normalizeOrderFees(
+                fills.map((f) => ({
+                  amount: f.fee,
+                  asset: aliasToken(f.feeToken),
+                })),
+              )
             }
             timeProfile = this.endProfilerTime(timeProfile, 'exchange')
           } catch (e) {
@@ -2056,6 +2284,7 @@ class HyperliquidExchange extends AbstractExchange implements Exchange {
             result.order.status,
             result.order.statusTimestamp,
             price,
+            fee,
           ),
         )
       })
@@ -3101,6 +3330,14 @@ class HyperliquidExchange extends AbstractExchange implements Exchange {
     status?: OrderResponseFound['order']['status'],
     timestamp?: number,
     filledPrice?: string,
+    /**
+     * The fee Hyperliquid charged, already normalised from the order's fills.
+     * Hyperliquid states the fee per FILL (`fee` + `feeToken`) and nowhere on
+     * the resting-order struct, so it can only be supplied by a caller that
+     * fetched the fills — which the `getOrder` path already does to recover
+     * the real fill price.
+     */
+    fee?: OrderFeeFields,
   ): Promise<CommonOrder> {
     const orderStatus: OrderStatusType =
       status === 'open' ? 'NEW' : status === 'filled' ? 'FILLED' : 'CANCELED'
@@ -3128,6 +3365,7 @@ class HyperliquidExchange extends AbstractExchange implements Exchange {
       quote = 0
     }
     const response: CommonOrder = {
+      ...(fee ?? {}),
       symbol: await this.getPairByCoin(order.coin),
       orderId: order.oid,
       clientOrderId: order.cloid,
@@ -3383,7 +3621,17 @@ class HyperliquidExchange extends AbstractExchange implements Exchange {
           )
         }
       } else {
-        const message = msg
+        // The SDK's wallet-dispatch rejection is bare ("unsupported wallet for
+        // signing typed data") and reached the user's bot log verbatim, saying
+        // nothing about which credential is wrong or what to do (Claus #551).
+        // Append the instruction, keeping the SDK substring first and intact so
+        // existing bot-error rules keyed on it still match.
+        const message =
+          msg.indexOf(HL_UNSUPPORTED_WALLET) !== -1
+            ? `${msg} — the saved Hyperliquid API wallet private key is not a ` +
+              `usable signing key, so no order, cancel or leverage change can ` +
+              `be sent. Re-enter it on the Exchanges page. ${HL_SIGNING_KEY_HELP}`
+            : msg
         return this.returnBad(timeProfile)(new Error(message))
       }
     }

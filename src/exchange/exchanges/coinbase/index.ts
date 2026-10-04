@@ -50,11 +50,66 @@ import {
   CoinbaseFees,
   CreateOrderResponse,
   CurrentApiKeyPermissions,
+  OrderListQueryParam,
 } from 'coinbase-advanced-node'
 import limitHelper from './limit'
+import { unstatedOrderFields, unreadableOrderPayload } from './orderPayload'
+import { normalizeSidedOrderFee } from '../../helpers/orderFee'
 import { Logger } from '@nestjs/common'
 import { sleep } from '../../../utils/sleepUtils'
 import { AxiosError } from 'axios'
+import { safeStringify } from '../../../utils/redact'
+
+/**
+ * Normalise whatever the Coinbase SDK threw into an Error safe to surface.
+ *
+ * Two hazards. The SDK staples the *request* onto its errors and a signed
+ * Coinbase request carries live credentials, so nothing here may be
+ * interpolated raw — object payloads go through `safeStringify`. And the
+ * message now reaches a user-facing string in main-app, not just a log line,
+ * so it is capped rather than allowed to carry a whole response body.
+ */
+const coinbaseAuthError = (e: unknown): Error => {
+  const err = e as
+    | { message?: unknown; body?: unknown; response?: { data?: unknown } }
+    | undefined
+  const body = err?.body ?? err?.response?.data
+  const parts: string[] = []
+  if (typeof err?.message === 'string' && err.message) {
+    parts.push(err.message)
+  }
+  if (body !== undefined) {
+    parts.push(typeof body === 'string' ? body : safeStringify(body))
+  }
+  const message = parts.join(' ').trim() || safeStringify(e)
+  return new Error(message.length > 300 ? `${message.slice(0, 300)}…` : message)
+}
+
+/**
+ * Rows per page when listing orders.
+ *
+ * This has to be sent explicitly: `coinbase-advanced-node`'s `getOrders`
+ * substitutes `limit = 25` whenever the caller omits one, so an unpaginated
+ * caller silently gets 25 orders and no indication that there were more. 250
+ * is the page size `getBalance` already uses against Coinbase in this file.
+ */
+const ORDER_PAGE_SIZE = 250
+
+/**
+ * Hard ceiling on pages walked in one listing call (= 5 000 orders).
+ *
+ * A venue that keeps saying `has_next` — through a bug or a bad cursor — must
+ * not be able to hold this method open indefinitely.
+ */
+const MAX_ORDER_PAGES = 20
+
+/**
+ * `getOrders` forwards its whole query object into the request's query string,
+ * so `cursor` does reach Coinbase; the SDK's published `OrderListQueryParam`
+ * simply never declared the field. Naming the widening once, here, keeps the
+ * cast off the call site.
+ */
+type OrderPageQuery = OrderListQueryParam & { cursor?: string }
 
 class CoinbaseError extends Error {}
 
@@ -286,9 +341,26 @@ class CoinbaseExchange extends AbstractExchange implements Exchange {
         if (account.data.length) {
           return this.returnGood<boolean>(timeProfile)(true)
         }
+        // Authenticated, but the key can see no portfolios. A real answer, and
+        // distinct from the rejection below.
         return this.returnGood<boolean>(timeProfile)(false)
       })
-      .catch(() => this.returnGood<boolean>(timeProfile)(false))
+      .catch((e: unknown) => {
+        // This used to be `.catch(() => returnGood(false))`, which reported
+        // every failure as a SUCCESSFUL "no permission" and threw the cause
+        // away. Coinbase is the only venue whose verification told main-app
+        // literally nothing — `{"status":"OK","data":false,"reason":null}` —
+        // for a wrong key type, a bad signature, an IP block and a revoked key
+        // alike. It was the single largest verification-failure bucket in prod
+        // (75 of 370 over 2026-08-04..28, one user retrying 19 times) and the
+        // only one that could not be diagnosed downstream, because the
+        // evidence was destroyed here.
+        //
+        // The verdict is unchanged — a rejection is still "cannot use this
+        // key" — so no caller's decision moves; only the reason survives.
+        timeProfile = this.endProfilerTime(timeProfile, 'exchange')
+        return this.returnBad(timeProfile)(coinbaseAuthError(e))
+      })
   }
 
   override returnGood<T>(
@@ -348,7 +420,7 @@ class CoinbaseExchange extends AbstractExchange implements Exchange {
             )
           }
           return this.returnGood<CommonOrder>(timeProfile)(
-            await this.convertOrder(order),
+            await this.convertOrder(order, newClientOrderId),
           )
         }
         return this.handleCoinbaseErrors(
@@ -439,9 +511,10 @@ class CoinbaseExchange extends AbstractExchange implements Exchange {
   ) {
     timeProfile =
       (await this.checkLimits('private', timeProfile)) || timeProfile
-    const input: { product_id?: string; order_status: OrderStatus[] } = {
+    const input: OrderPageQuery = {
       product_id: symbol,
       order_status: [OrderStatus.OPEN],
+      limit: ORDER_PAGE_SIZE,
     }
     if (!symbol) {
       delete input.product_id
@@ -451,16 +524,54 @@ class CoinbaseExchange extends AbstractExchange implements Exchange {
       this.client.rest.order.getOrders(input),
     )
       .then(async (orders) => {
+        // Coinbase returns open orders one page at a time. Follow
+        // `has_next`/`cursor` to the end, the way `getBalance` does below —
+        // otherwise an account with more resting orders than one page reports
+        // only its first page, with no error to say so. Keyed by order id so a
+        // cursor that fails to advance cannot double-count a page.
+        const byId = new Map<string, Order>()
+        for (const o of orders.data) {
+          byId.set(o.order_id, o)
+        }
+        let pagination = orders.pagination
+        const requested = new Set<string>()
+        let pages = 1
+        while (
+          pagination?.has_next &&
+          pagination.cursor &&
+          !requested.has(pagination.cursor) &&
+          pages < MAX_ORDER_PAGES
+        ) {
+          const cursor = pagination.cursor
+          requested.add(cursor)
+          pages++
+          timeProfile = this.endProfilerTime(timeProfile, 'exchange')
+          timeProfile =
+            (await this.checkLimits('private', timeProfile)) || timeProfile
+          timeProfile = this.startProfilerTime(timeProfile, 'exchange')
+          const pageQuery: OrderPageQuery = { ...input, cursor }
+          const page = await this.callWithTimeout<PaginatedData<Order>>(() =>
+            this.client.rest.order.getOrders(pageQuery),
+          )
+          if (!page.data.length) {
+            break
+          }
+          for (const o of page.data) {
+            byId.set(o.order_id, o)
+          }
+          pagination = page.pagination
+        }
+        const allOrders = [...byId.values()]
         timeProfile = this.endProfilerTime(timeProfile, 'exchange')
         const convertedOrders: CommonOrder[] = []
         if (returnOrders) {
-          for (const o of orders.data) {
+          for (const o of allOrders) {
             const data = await this.convertOrder(o)
             convertedOrders.push(data)
           }
           return this.returnGood<CommonOrder[]>(timeProfile)(convertedOrders)
         }
-        return this.returnGood<number>(timeProfile)(orders.data.length)
+        return this.returnGood<number>(timeProfile)(allOrders.length)
       })
       .catch(
         this.handleCoinbaseErrors<BaseReturn<CommonOrder[] | number>>(
@@ -604,7 +715,7 @@ class CoinbaseExchange extends AbstractExchange implements Exchange {
           }
         }
         return this.returnGood<CommonOrder>(timeProfile)(
-          await this.convertOrder(res),
+          await this.convertOrder(res, newClientOrderId),
         )
       })
       .catch(
@@ -895,7 +1006,32 @@ class CoinbaseExchange extends AbstractExchange implements Exchange {
    * @param {boolean} needFills is needed to query fills
    * @returns {Promise<CommonOrder>} Common order result
    */
-  private async convertOrder(order?: Order): Promise<CommonOrder> {
+  private async convertOrder(
+    order?: Order,
+    askedFor?: string,
+  ): Promise<CommonOrder> {
+    // Spec `008`. Everything below substitutes a default for whatever the
+    // payload omits — `order_type` becomes `MARKET`, `side` becomes `BUY`, a
+    // missing `created_time` becomes `new Date(undefined)` — and the caller
+    // wraps the result in `returnGood`. So a payload that says `FILLED` and
+    // nothing else came back as a confident, fully formed FILLED MARKET BUY
+    // order, and the bot engine persisted that stamp over live order rows of
+    // every kind, including take-profits that had been placed SELL LIMIT.
+    //
+    // `status: OK` means "here is the venue's answer" (`BaseReturn`, the
+    // platform's most load-bearing contract) and no consumer has a second
+    // source to check it against. A payload that does not say what the order
+    // IS is not an answer about it — refuse, and let the caller's reconcile
+    // ask again, which is what it is built to do.
+    const unstated = unstatedOrderFields(order)
+    if (unstated.length) {
+      throw new CoinbaseError(
+        unreadableOrderPayload(
+          askedFor ?? order?.order_id ?? 'order',
+          unstated,
+        ),
+      )
+    }
     const orderStatus = (): OrderStatusType => {
       const { status, completion_percentage } = order
       if ([OrderStatus.OPEN, OrderStatus.PENDING].includes(status)) {
@@ -930,7 +1066,13 @@ class CoinbaseExchange extends AbstractExchange implements Exchange {
             ? order.average_filled_price
             : limitPrice
           : limitPrice
+    // Coinbase Advanced Trade reports the fee it charged on the order itself
+    // as `total_fees`. There is no fee-currency field because there is nothing
+    // to disambiguate: Coinbase settles every trading fee in the product's
+    // QUOTE currency, so the side is stated directly rather than recovered by
+    // splitting `product_id`.
     return {
+      ...normalizeSidedOrderFee(order.total_fees, 'quote'),
       symbol: order.product_id,
       orderId: order.order_id,
       clientOrderId: order.client_order_id,

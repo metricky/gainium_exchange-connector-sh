@@ -65,6 +65,46 @@ const ADD_ORDER_COST = 1
 const CANCEL_ORDER_COST = 8 // Worst case for fresh orders
 const AMEND_ORDER_COST = 4 // Average case
 
+/**
+ * Kraken's published matching-engine penalty for cancelling ONE order, by how
+ * long that order has been resting
+ * (https://docs.kraken.com/api/docs/guides/spot-ratelimits): `< 5s` +8,
+ * `< 10s` +6, `< 15s` +5, `< 45s` +4, `< 90s` +2, `< 300s` +1, and **0** at or
+ * above 300s. `[maxAgeSeconds, cost]`, first match wins.
+ *
+ * The flat {@link CANCEL_ORDER_COST} above is the `< 5s` worst case, which is
+ * the only honest answer when the call site does not know the order's age. A
+ * batch cancel DOES know it — it reads every order in the batch before
+ * cancelling, and Kraken's `opentm` is on that row — so it can charge what
+ * Kraken actually charges instead of the worst case for all of them.
+ */
+const CANCEL_COST_BY_AGE: ReadonlyArray<readonly [number, number]> = [
+  [5, 8],
+  [10, 6],
+  [15, 5],
+  [45, 4],
+  [90, 2],
+  [300, 1],
+]
+
+/**
+ * The matching-engine cost of cancelling one order that has rested
+ * `ageSeconds`. An age that is not a finite, non-negative number is charged the
+ * worst case: an unknown age must never be cheaper than a known one, or an
+ * unreadable `opentm` becomes a way to under-charge the budget.
+ */
+export function krakenCancelCostForAge(ageSeconds: number): number {
+  if (!Number.isFinite(ageSeconds) || ageSeconds < 0) {
+    return CANCEL_ORDER_COST
+  }
+  for (const [maxAge, cost] of CANCEL_COST_BY_AGE) {
+    if (ageSeconds < maxAge) {
+      return cost
+    }
+  }
+  return 0
+}
+
 // ── Per-account state (used only when KRAKEN_PER_ACCOUNT_LIMITS=true) ─────────
 type RestState = {
   restCounter: number
@@ -220,19 +260,19 @@ class KrakenLimits {
   }
 
   /**
-   * Check and wait for REST API rate limit. When `accountKey` is provided and
-   * per-account limits are enabled, the budget is tracked for that key alone;
-   * otherwise it falls back to the process-wide global counter. The mutex key
-   * is scoped to the account so distinct accounts don't serialize each other.
+   * The REST budget's verdict for one call: 0 if it may go now, else how long to
+   * wait. `commit` decides whether the cost is actually spent — a probe reads
+   * the same arithmetic without taking a token. Decay is applied either way;
+   * decay is clock accounting, not spending.
+   *
+   * Synchronous and un-decorated on purpose: `addOrderCall` has to decide across
+   * BOTH budgets without yielding, and the mutex is not reentrant.
    */
-  @IdMute(
-    mutex,
-    (accountKey?: string) => `krakenRest:${accountKey ?? 'global'}`,
-  )
-  async checkRestLimit(
-    accountKey?: string,
-    cost: number = REST_CALL_COST,
-  ): Promise<number> {
+  private restVerdict(
+    accountKey: string | undefined,
+    cost: number,
+    commit: boolean,
+  ): number {
     if (perAccountEnabled() && accountKey) {
       const s = getRestState(accountKey)
       applyRestDecayState(s)
@@ -242,7 +282,7 @@ class KrakenLimits {
         const excess = predictedCounter - tier.max
         return Math.ceil((excess / tier.decay) * 1000) + 100 // +100ms buffer
       }
-      s.restCounter = predictedCounter
+      if (commit) s.restCounter = predictedCounter
       return 0
     }
 
@@ -252,24 +292,21 @@ class KrakenLimits {
       const excess = predictedCounter - REST_MAX_COUNTER
       return Math.ceil((excess / REST_DECAY_RATE) * 1000) + 100 // +100ms buffer
     }
-    restCounter = predictedCounter
+    if (commit) restCounter = predictedCounter
     return 0
   }
 
   /**
-   * Check and wait for matching engine rate limit (per pair, and per account
+   * The matching-engine budget's verdict for one call (per pair, and per account
    * when enabled — Kraken's matching-engine limits are per pair *per account*).
+   * Same `commit` semantics as `restVerdict`.
    */
-  @IdMute(
-    mutex,
-    (accountKey: string | undefined, pair: string) =>
-      `krakenPair:${accountKey ?? 'global'}:${pair}`,
-  )
-  async checkMatchingEngineLimit(
+  private engineVerdict(
     accountKey: string | undefined,
     pair: string,
-    cost: number = ADD_ORDER_COST,
-  ): Promise<number> {
+    cost: number,
+    commit: boolean,
+  ): number {
     if (perAccountEnabled() && accountKey) {
       const p = getPairState(`${accountKey}|${pair}`)
       applyPairDecayState(p)
@@ -278,8 +315,10 @@ class KrakenLimits {
         const excess = predictedCounter - MATCHING_ENGINE_THRESHOLD
         return Math.ceil((excess / MATCHING_ENGINE_DECAY_RATE) * 1000) + 100
       }
-      p.counter = predictedCounter
-      p.lastUpdate = Date.now()
+      if (commit) {
+        p.counter = predictedCounter
+        p.lastUpdate = Date.now()
+      }
       return 0
     }
 
@@ -300,11 +339,98 @@ class KrakenLimits {
       return waitTime
     }
 
-    pairData.counter = predictedCounter
-    pairData.lastUpdate = Date.now()
-    pairCounters.set(pair, pairData)
+    if (commit) {
+      pairData.counter = predictedCounter
+      pairData.lastUpdate = Date.now()
+      pairCounters.set(pair, pairData)
+    }
 
     return 0
+  }
+
+  /**
+   * Is the pair's matching-engine counter, after decay, currently BELOW the
+   * threshold? 0 when it is, else how long until it is.
+   *
+   * Deliberately NOT `engineVerdict`'s question. That one asks "does counter +
+   * cost stay under the threshold", which is the right question for a call
+   * Kraken would reject over the threshold. A batch cancel is not such a call:
+   * Kraken accepts it and lets the counter overshoot. Asking the predicted
+   * question about it is unanswerable rather than strict — 46 fresh orders cost
+   * far more than the threshold of 125 on their own, so no amount of decay ever
+   * admits them and `checkLimits` gives up after its bounded wait, every time.
+   *
+   * Same `commit`-free, synchronous contract as the two verdict helpers: the
+   * caller decides across both budgets without yielding.
+   */
+  private engineBelowThreshold(
+    accountKey: string | undefined,
+    pair: string,
+  ): number {
+    const waitFrom = (counter: number) =>
+      counter < MATCHING_ENGINE_THRESHOLD
+        ? 0
+        : Math.ceil(
+            ((counter - MATCHING_ENGINE_THRESHOLD) /
+              MATCHING_ENGINE_DECAY_RATE) *
+              1000,
+          ) + 100 // +100ms buffer
+
+    if (perAccountEnabled() && accountKey) {
+      const p = getPairState(`${accountKey}|${pair}`)
+      applyPairDecayState(p)
+      return waitFrom(p.counter)
+    }
+
+    this.applyMatchingEngineDecay(pair)
+    return waitFrom(pairCounters.get(pair)?.counter ?? 0)
+  }
+
+  /**
+   * Spend `cost` on the pair's matching-engine counter unconditionally — the
+   * commit half of {@link engineBelowThreshold}. The counter may end up ABOVE
+   * the threshold, which is correct and is the whole point: Kraken's own
+   * counter does exactly that, and carrying the overshoot is what delays the
+   * following calls on this pair by as long as Kraken will delay them.
+   */
+  private engineCharge(
+    accountKey: string | undefined,
+    pair: string,
+    cost: number,
+  ) {
+    if (perAccountEnabled() && accountKey) {
+      const p = getPairState(`${accountKey}|${pair}`)
+      applyPairDecayState(p)
+      p.counter += cost
+      p.lastUpdate = Date.now()
+      return
+    }
+
+    this.applyMatchingEngineDecay(pair)
+    const pairData = pairCounters.get(pair) || {
+      counter: 0,
+      lastUpdate: Date.now(),
+    }
+    pairData.counter += cost
+    pairData.lastUpdate = Date.now()
+    pairCounters.set(pair, pairData)
+  }
+
+  /**
+   * Check and wait for REST API rate limit. When `accountKey` is provided and
+   * per-account limits are enabled, the budget is tracked for that key alone;
+   * otherwise it falls back to the process-wide global counter. The mutex key
+   * is scoped to the account so distinct accounts don't serialize each other.
+   */
+  @IdMute(
+    mutex,
+    (accountKey?: string) => `krakenRest:${accountKey ?? 'global'}`,
+  )
+  async checkRestLimit(
+    accountKey?: string,
+    cost: number = REST_CALL_COST,
+  ): Promise<number> {
+    return this.restVerdict(accountKey, cost, true)
   }
 
   /**
@@ -319,8 +445,29 @@ class KrakenLimits {
   }
 
   /**
-   * Add an order-related call (matching engine).
+   * Add an order-related call. Kraken meters it against TWO budgets — the
+   * per-key REST counter and the per-pair matching-engine counter — and the
+   * call only reaches the venue when both admit.
+   *
+   * So the two are spent together or not at all. Asking each in turn and
+   * letting whichever admits charge itself meant a call the caller was told to
+   * DEFER still took a token in the other bucket; `checkLimits` re-asks until
+   * the budget admits it (index.ts), so that token was taken again on every
+   * attempt. Measured on the shipped module, one sent call cost 1.70 REST
+   * tokens on the cancel path and 2.00 matching-engine charges on the add path
+   * — surplus load Kraken never saw, paced against a bucket that refills at
+   * 0.33-0.5/s.
+   *
+   * Probe, then commit, with no `await` in between: the decision is atomic
+   * under this method's own mutex, so nothing can take the last token between
+   * the two. The mutex key is the account's REST key — plain REST calls share
+   * that bucket and must serialise against this.
    */
+  @IdMute(
+    mutex,
+    (_pair: string, _type: string, accountKey?: string) =>
+      `krakenRest:${accountKey ?? 'global'}`,
+  )
   async addOrderCall(
     pair: string,
     type: 'add' | 'cancel' | 'amend',
@@ -333,15 +480,61 @@ class KrakenLimits {
           ? CANCEL_ORDER_COST
           : AMEND_ORDER_COST
 
-    // Check both REST and matching engine limits
-    const restWait = await this.checkRestLimit(accountKey, REST_CALL_COST)
-    const engineWait = await this.checkMatchingEngineLimit(
-      accountKey,
-      pair,
-      cost,
-    )
+    const restWait = this.restVerdict(accountKey, REST_CALL_COST, false)
+    const engineWait = this.engineVerdict(accountKey, pair, cost, false)
+    if (restWait > 0 || engineWait > 0) {
+      return Math.max(restWait, engineWait)
+    }
 
-    return Math.max(restWait, engineWait)
+    this.restVerdict(accountKey, REST_CALL_COST, true)
+    this.engineVerdict(accountKey, pair, cost, true)
+    return 0
+  }
+
+  /**
+   * One BATCH order call — `AddOrderBatch` or `CancelOrderBatch`. Same two
+   * budgets and the same probe-then-commit atomicity as {@link addOrderCall}
+   * (both spent together or not at all, no `await` between the probe and the
+   * commit, under the same account-scoped mutex), with two differences that are
+   * Kraken's, not ours:
+   *
+   * - **REST is ONE call.** A batch carrying 50 ids costs the per-key counter
+   *   the same +1 as a batch carrying 2. Not spending 50 tokens out of a
+   *   20-token bucket refilling at 0.5/s is the entire reason batching exists.
+   * - **The matching-engine cost is the caller's**, because only the caller
+   *   knows it: one per order for an add, and the sum of the per-order
+   *   age-scaled cancel costs ({@link krakenCancelCostForAge}) for a cancel.
+   *
+   * An `add` is admitted on the ordinary predicted-counter check — Kraken caps
+   * a batch at 15 orders (+1 each) against a threshold of 125, so it always
+   * fits once the counter has decayed far enough. A `cancel` is admitted
+   * whenever the counter is currently below the threshold, and then charged in
+   * full: see {@link engineBelowThreshold} for why the predicted check cannot
+   * be used for it.
+   */
+  @IdMute(
+    mutex,
+    (_pair: string, _type: string, _engineCost: number, accountKey?: string) =>
+      `krakenRest:${accountKey ?? 'global'}`,
+  )
+  async addOrderBatchCall(
+    pair: string,
+    type: 'add' | 'cancel',
+    engineCost: number,
+    accountKey?: string,
+  ): Promise<number> {
+    const restWait = this.restVerdict(accountKey, REST_CALL_COST, false)
+    const engineWait =
+      type === 'add'
+        ? this.engineVerdict(accountKey, pair, engineCost, false)
+        : this.engineBelowThreshold(accountKey, pair)
+    if (restWait > 0 || engineWait > 0) {
+      return Math.max(restWait, engineWait)
+    }
+
+    this.restVerdict(accountKey, REST_CALL_COST, true)
+    this.engineCharge(accountKey, pair, engineCost)
+    return 0
   }
 
   /**
@@ -419,8 +612,15 @@ const limits = KrakenLimits.getInstance()
 export default {
   addRestCall: limits.addRestCall.bind(limits),
   addOrderCall: limits.addOrderCall.bind(limits),
+  addOrderBatchCall: limits.addOrderBatchCall.bind(limits),
   getUsage: limits.getUsage.bind(limits),
   noteRateLimited: limits.noteRateLimited.bind(limits),
 }
 
-export { ADD_ORDER_COST, CANCEL_ORDER_COST, AMEND_ORDER_COST }
+export {
+  ADD_ORDER_COST,
+  CANCEL_ORDER_COST,
+  AMEND_ORDER_COST,
+  REST_MAX_COUNTER,
+  MATCHING_ENGINE_THRESHOLD,
+}

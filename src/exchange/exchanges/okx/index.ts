@@ -40,10 +40,13 @@ import {
   type RestClientOptions,
 } from 'okx-api'
 import limitHelper from './limit'
+import { normalizeOrderFee } from '../../helpers/orderFee'
 import { Logger } from '@nestjs/common'
 import { sleep } from '../../../utils/sleepUtils'
 import { RestClient as OKXOrderRestClient } from '../../../okx-custom/rest-client'
 import { round } from '../../../utils/math'
+import { okxCollateralIsPooled, pooledMarginFromOkx } from './pooledMargin'
+import { createHash } from 'crypto'
 
 class OKXError extends Error {
   code: number
@@ -51,6 +54,36 @@ class OKXError extends Error {
   constructor(message: string, code: number) {
     super(message)
     this.code = code
+  }
+}
+
+/**
+ * OKX's own instrument classification (`instCategory` on every
+ * `/api/v5/public/instruments` and `/api/v5/account/instruments` row) mapped to
+ * the platform asset class. Present on SPOT, SWAP and FUTURES alike, so one
+ * mapper covers every OKX market:
+ *   - `1` -> crypto (left undefined so consumers apply their own default and
+ *     existing rows stay untouched)
+ *   - `3` -> stock. OKX groups equities and equity ETFs under the SAME value and
+ *     exposes no sub-signal to separate them, so ETFs (QQQ, SPY) stay `stock`
+ *     rather than being guessed from a ticker list.
+ *   - `4` -> commodity (metals XAU/XAG and energy CL/BZ; matches how Binance's
+ *     `COMMODITY` underlyingType is mapped).
+ * Anything unknown returns undefined rather than guessing.
+ *
+ * `instCategory` is absent from the `okx-api` SDK's typed `Instrument`, hence
+ * the `@ts-ignore` at the call site.
+ */
+export function okxAssetClass(
+  instCategory?: string,
+): ExchangeInfo['assetClass'] {
+  switch (`${instCategory ?? ''}`) {
+    case '3':
+      return 'stock'
+    case '4':
+      return 'commodity'
+    default:
+      return undefined
   }
 }
 
@@ -83,6 +116,15 @@ export const timeIntervalMap = {
  * where a limit replaced the requested range.
  */
 const candleMaxSize = 300
+
+/**
+ * Floor between two X-Perp instrument refreshes triggered by a cache MISS
+ * (see `ensureXperpMap`). Long enough that a symbol OKX genuinely does not
+ * serve costs at most one extra instruments fetch per window, short enough
+ * that a newly listed X-Perp resolves on the next call instead of waiting out
+ * the 1h map cache.
+ */
+const XPERP_MISS_RETRY_MS = 5 * 60 * 1000
 
 /**
  * Backoff for OKX `50011 Too many requests`.
@@ -132,9 +174,25 @@ class OKXExchange extends AbstractExchange implements Exchange {
    * OKX Europe X-Perp (instType=FUTURES, ruleType=xperp) instFamily -> live instId
    * map, e.g. `BTC-USD_UM_XPERP` -> `BTC-USD_UM_XPERP-310404`. Populated from the
    * instruments feed; the expiry suffix rolls rarely so we cache it (1h).
+   *
+   * Process-wide, not per instance: the service builds a fresh exchange for
+   * every request, so an instance map was empty on every order and every
+   * order re-downloaded the whole FUTURES instrument list. When that public
+   * call failed (a burst of bot orders trips its rate limit) the failure was
+   * swallowed, `updateSymbol` handed OKX the bare instFamily and the order was
+   * rejected with 51001 ("Instrument ID ... doesn't exist"). The instFamily ->
+   * instId mapping is the same on every OKX host, so one copy serves all.
    */
-  private xperpMap = new Map<string, string>()
-  private xperpMapLoaded = 0
+  private static xperpMap = new Map<string, string>()
+  private static xperpMapLoaded = 0
+  /**
+   * Last refresh triggered by a cache MISS, per instFamily (see
+   * {@link ensureXperpMap}). Per pair because the map is shared: one pair OKX
+   * does not serve must not hold back the refresh another pair needs.
+   */
+  private static xperpMapMissLoaded = new Map<string, number>()
+  /** In-flight instruments refresh, shared so a burst of orders asks once. */
+  private static xperpMapLoading?: Promise<void>
 
   /**
    * In-flight de-duplication for `GET /api/v5/account/config`.
@@ -167,6 +225,58 @@ class OKXExchange extends AbstractExchange implements Exchange {
         })
     }
     return this.accountConfigInFlight
+  }
+
+  /**
+   * Account mode (`acctLv`) per account, cached briefly.
+   *
+   * Unlike {@link accountConfig}, which shares only the in-flight promise,
+   * this keeps the settled value: it is read on the ORDER path, and
+   * `account/config` is rate-limited per **UserID**, so asking once per order
+   * would spend a scarce budget on a value that changes only when the user
+   * deliberately switches account mode. A short TTL keeps that rare change
+   * self-healing without a restart.
+   *
+   * Keyed by a digest of the credential (never the credential itself) plus
+   * the OKX origin, since global and Europe are separate accounts.
+   */
+  private static acctLvCache = new Map<string, { at: number; acctLv: string }>()
+  private static readonly ACCT_LV_TTL = 10 * 60 * 1000
+
+  private async getAcctLv(): Promise<string | undefined> {
+    const cacheKey = createHash('sha256')
+      .update(`${this.key ?? ''}|${this.okxSource ?? ''}`)
+      .digest('hex')
+      .slice(0, 16)
+    const cached = OKXExchange.acctLvCache.get(cacheKey)
+    if (cached && +new Date() - cached.at < OKXExchange.ACCT_LV_TTL) {
+      return cached.acctLv
+    }
+    return this.accountConfig()
+      .then((account) => {
+        const acctLv = account?.[0]?.acctLv
+        if (acctLv) {
+          OKXExchange.acctLvCache.set(cacheKey, { at: +new Date(), acctLv })
+        }
+        return acctLv
+      })
+      .catch(() => undefined)
+  }
+
+  /**
+   * `tdMode` for a SPOT order.
+   *
+   * `cash` is valid ONLY in OKX's Spot and Futures account modes. In
+   * Multi-currency margin (`acctLv` 3) and Portfolio margin (4) the spot book
+   * is part of the unified margin account and every spot order must be
+   * `cross`; `cash` is rejected outright with "Parameter tdMode error", so a
+   * bot on such an account cannot place a single order (2026-08-31: a new OKX
+   * Europe user, 58 orders, 0 fills). An unreadable account config falls back
+   * to `cash` — the behaviour that shipped before this existed.
+   */
+  private async spotTdMode(): Promise<'cash' | 'cross'> {
+    const acctLv = await this.getAcctLv()
+    return acctLv === '3' || acctLv === '4' ? 'cross' : 'cash'
   }
 
   constructor(
@@ -720,11 +830,11 @@ class OKXExchange extends AbstractExchange implements Exchange {
   ) {
     for (const s of res) {
       if (s.ruleType === 'xperp' && s.state === 'live') {
-        this.xperpMap.set(s.instFamily, s.instId)
+        OKXExchange.xperpMap.set(s.instFamily, s.instId)
       }
     }
-    if (this.xperpMap.size) {
-      this.xperpMapLoaded = +new Date()
+    if (OKXExchange.xperpMap.size) {
+      OKXExchange.xperpMapLoaded = +new Date()
     }
   }
 
@@ -739,14 +849,42 @@ class OKXExchange extends AbstractExchange implements Exchange {
     if (!this.isEuPerp && !(symbolHint && this.isXperpPair(symbolHint))) {
       return
     }
-    const fresh = +new Date() - this.xperpMapLoaded < 60 * 60 * 1000
-    if (this.xperpMap.size && fresh && !force) {
+    const now = +new Date()
+    const fresh = now - OKXExchange.xperpMapLoaded < 60 * 60 * 1000
+    // A map that is fresh but does NOT hold the instFamily we are about to
+    // translate is worthless for this call: `updateSymbol` falls through to
+    // `?? s` and hands OKX the bare instFamily, which it rejects with 51001
+    // ("Instrument ID ... doesn't exist"). That is what the hourly funding
+    // cron logged for a whole X-Perp symbol at a time, and it repeats every
+    // run until the 1h cache happens to expire. Refresh on the miss instead —
+    // rate-limited, so an instrument OKX genuinely does not serve cannot turn
+    // every call into an instruments fetch.
+    const family = symbolHint ? this.clearSymbol(symbolHint) : ''
+    const missing = !!family && !OKXExchange.xperpMap.has(family)
+    const missRetryable =
+      now - (OKXExchange.xperpMapMissLoaded.get(family) ?? 0) >=
+      XPERP_MISS_RETRY_MS
+    const usable = OKXExchange.xperpMap.size > 0 && fresh && !force
+    if (usable && !(missing && missRetryable)) {
       return
     }
-    const res = await this.client
-      .getInstruments({ instType: 'FUTURES' })
-      .catch(() => [] as Awaited<ReturnType<OKXRestClient['getInstruments']>>)
-    this.setXperpMap(res)
+    if (usable && missing) {
+      OKXExchange.xperpMapMissLoaded.set(family, now)
+    }
+    if (!OKXExchange.xperpMapLoading) {
+      OKXExchange.xperpMapLoading = this.client
+        .getInstruments({ instType: 'FUTURES' })
+        .then((res) => this.setXperpMap(res))
+        .catch((e: Error & { msg?: string; code?: string }) => {
+          Logger.warn(
+            `OKX X-Perp instrument refresh failed: ${e?.message ?? e?.msg ?? e} (${e?.code ?? ''})`,
+          )
+        })
+        .finally(() => {
+          OKXExchange.xperpMapLoading = undefined
+        })
+    }
+    await OKXExchange.xperpMapLoading
   }
 
   private getCategory() {
@@ -770,7 +908,7 @@ class OKXExchange extends AbstractExchange implements Exchange {
     timeProfile =
       (await this.checkLimits('cancelOrder', 3000, 25, timeProfile)) ||
       timeProfile
-    await this.ensureXperpMap()
+    await this.ensureXperpMap(false, order.symbol)
     const { newClientOrderId, symbol: _symbol } = order
     const symbol = this.updateSymbol(_symbol)
     timeProfile = this.startProfilerTime(timeProfile, 'exchange')
@@ -832,7 +970,7 @@ class OKXExchange extends AbstractExchange implements Exchange {
     timeProfile =
       (await this.checkLimits('cancelOrder', 3000, 25, timeProfile)) ||
       timeProfile
-    await this.ensureXperpMap()
+    await this.ensureXperpMap(false, order.symbol)
     const { orderId, symbol } = order
     timeProfile = this.startProfilerTime(timeProfile, 'exchange')
     return this.client
@@ -960,6 +1098,9 @@ class OKXExchange extends AbstractExchange implements Exchange {
         const step = this.futures ? minAmount : +s.lotSz
         return {
           pair: this.futures ? s.instFamily : s.instId,
+          // OKX classifies every instrument itself; no name heuristics needed.
+          //@ts-ignore -- instCategory is not on the SDK's typed Instrument
+          assetClass: okxAssetClass(s.instCategory),
           baseAsset: {
             minAmount,
             maxAmount: +s.maxLmtSz,
@@ -1212,6 +1353,40 @@ class OKXExchange extends AbstractExchange implements Exchange {
       )
   }
 
+  /**
+   * Pooled collateral in USD for a futures connection on a Multi-currency or
+   * Portfolio margin account (see {@link pooledMarginFromOkx}); `null` for
+   * spot, for the other account modes, and when the mode can't be read.
+   *
+   * Two reads (account mode, cached; then the balance). Callers ask only
+   * after their own per-coin check has come up short.
+   */
+  async getMarginAvailableUsd(
+    timeProfile = this.getEmptyTimeProfile(),
+  ): Promise<BaseReturn<number | null>> {
+    if (!this.futures || !okxCollateralIsPooled(await this.getAcctLv())) {
+      return this.returnGood<number | null>(timeProfile)(null)
+    }
+    timeProfile =
+      (await this.checkLimits('getBalance', 3000, 5, timeProfile)) ||
+      timeProfile
+    timeProfile = this.startProfilerTime(timeProfile, 'exchange')
+    return this.client
+      .getBalance()
+      .then(async (balances) => {
+        timeProfile = this.endProfilerTime(timeProfile, 'exchange')
+        return this.returnGood<number | null>(timeProfile)(
+          pooledMarginFromOkx(await this.getAcctLv(), balances?.[0]),
+        )
+      })
+      .catch(
+        this.handleOkxErrors(
+          this.getMarginAvailableUsd,
+          this.endProfilerTime(timeProfile, 'exchange'),
+        ),
+      )
+  }
+
   /** Get exchange info for given pair
    * @param {string} symbol symbol to look for
    * @param count
@@ -1239,7 +1414,7 @@ class OKXExchange extends AbstractExchange implements Exchange {
       (await this.checkLimits('getOrderDetails', 3000, 25, timeProfile)) ||
       timeProfile
 
-    await this.ensureXperpMap()
+    await this.ensureXperpMap(false, data.symbol)
     const { newClientOrderId, symbol: _symbol } = data
     const symbol = this.updateSymbol(_symbol)
     timeProfile = this.startProfilerTime(timeProfile, 'exchange')
@@ -1304,7 +1479,7 @@ class OKXExchange extends AbstractExchange implements Exchange {
   private updateSymbol(s: string) {
     if (this.isEuPerp || this.isXperpPair(s)) {
       // gainium pair == instFamily (BTC-USD_UM_XPERP) -> live instId with expiry
-      return this.xperpMap.get(s) ?? s
+      return OKXExchange.xperpMap.get(s) ?? s
     }
     return `${s}${this.futures ? '-SWAP' : ''}`
   }
@@ -1356,8 +1531,9 @@ class OKXExchange extends AbstractExchange implements Exchange {
       positionSide,
       marginType,
     } = order
-    await this.ensureXperpMap()
+    await this.ensureXperpMap(false, _symbol)
     const symbol = this.updateSymbol(_symbol)
+    const spotTdMode = this.futures ? undefined : await this.spotTdMode()
     const request: OrderRequest = {
       instId: symbol,
       side: side === 'BUY' ? 'buy' : 'sell',
@@ -1368,7 +1544,7 @@ class OKXExchange extends AbstractExchange implements Exchange {
         ? marginType === MarginType.CROSSED
           ? 'cross'
           : 'isolated'
-        : 'cash',
+        : (spotTdMode ?? 'cash'),
       tgtCcy: 'base_ccy',
       tag: this.code,
     }
@@ -1733,7 +1909,15 @@ class OKXExchange extends AbstractExchange implements Exchange {
     }
     const size = order.accFillSz || order.fillSz || order.sz
     const price = +(order.avgPx ?? order.px) || +order.px
+    // OKX states the fee it charged on the order itself: `fee` with `feeCcy`
+    // naming the currency. It is reported NEGATIVE for a charge and positive
+    // for a rebate (OKX's sign convention is "effect on the balance"), which
+    // `normalizeOrderFee` turns into the magnitude of the cost. `rebate` is a
+    // separate field and deliberately not netted off here — a rebate is a
+    // credit, not a smaller fee, and the deal's cost basis is the fee.
+    const fee = normalizeOrderFee(order.fee, order.feeCcy)
     return {
+      ...fee,
       symbol: this.clearSymbol(order.instId),
       orderId: order.ordId,
       clientOrderId: order.clOrdId,
@@ -1893,6 +2077,19 @@ class OKXExchange extends AbstractExchange implements Exchange {
         }
       } else {
         const message = e.message
+        const symbol = (args[0] as { symbol?: unknown } | undefined)?.symbol
+        if (`${e.code}` === '51001' && typeof symbol === 'string') {
+          // Name the instId we actually sent, so a recurrence says whether we
+          // built it wrong or OKX does not serve it. A stale X-Perp entry (its
+          // expiry tag rolled) is dropped so the next call refetches.
+          const instId = this.updateSymbol(symbol)
+          Logger.warn(
+            `OKX 51001 on ${cb.name} for ${symbol}: sent instId ${instId}, X-Perp map ${OKXExchange.xperpMap.size} rows`,
+          )
+          if (this.isXperpPair(symbol)) {
+            OKXExchange.xperpMapLoaded = 0
+          }
+        }
         return this.returnBad(timeProfile)(new Error(message))
       }
     }
@@ -1943,10 +2140,10 @@ class OKXExchange extends AbstractExchange implements Exchange {
     // `updateSymbol` fell through to `xperpMap.get(s) ?? s` and handed OKX the
     // bare instFamily.
     //
-    // Measured on prod, hourly and identically since 2026-08-21 (72 failures):
+    // Observed in production, hourly and identically:
     //   instId=SOL-USD_UM_XPERP      → 51001 "Instrument ID … doesn't exist"
     //   instId=SOL-USD_UM_XPERP-310404 → code 0, real funding rates
-    // Same shape hit XRP-USD_UM_XPERP on 08-08. It is not one poisoned registry
+    // The same shape hit XRP-USD_UM_XPERP. It is not one poisoned registry
     // entry — it is every X-Perp symbol that ever holds a position, and while it
     // fails NO funding events are published for that symbol at all.
     //

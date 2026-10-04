@@ -1,0 +1,1550 @@
+process.env.NODE_ENV = 'testing'
+
+/**
+ * Bitget Unified Trading Account (v3) support, and Reality stock tokens.
+ *
+ * A unified account is refused by every classic v2 private endpoint, and
+ * Reality tokens (rAAPL…) can only be traded from one. The adapter now picks
+ * v2 or v3 per key; public market data stays on v2.
+ *
+ * Run: `npm test` (mocha). No network — both REST clients are stubbed with
+ * bodies shaped like the venue's (the custom client throws
+ * `{ code, message, body: { code, msg } }` for any non-'00000' body).
+ */
+import { beforeEach, describe, it } from 'mocha'
+import {
+  ExchangeIntervals,
+  Futures,
+  MarginType,
+  PositionSide,
+  StatusEnum,
+} from '../../types'
+import BitgetExchange from './index'
+import {
+  COINM_PERP_NEEDS_UTA,
+  REALITY_NEEDS_UTA,
+  UTA_COINM_UNSUPPORTED,
+  UTA_MISSING_PERMISSIONS,
+  UTA_BASIC_MODE_UNSUPPORTED,
+  accountModeFromSettings,
+  clearAccountModeCache,
+  convertUtaAssets,
+  convertUtaOrder,
+  pooledMarginFromUta,
+  aggregateCandles,
+  realityBaseInterval,
+  realityGranularity,
+  setRealitySymbols,
+} from './uta'
+
+const UNIFIED_REFUSAL =
+  'you are in unified account mode, and the classic account api is not supported at this time'
+
+const bitgetError = (code: string, msg: string) => ({
+  code: 400,
+  message: 'Bad Request',
+  body: { code, msg },
+})
+
+function eq(label: string, actual: unknown, want: unknown) {
+  if (JSON.stringify(actual) !== JSON.stringify(want)) {
+    throw new Error(
+      `${label}: got ${JSON.stringify(actual)} want ${JSON.stringify(want)}`,
+    )
+  }
+}
+
+const orderRow = (o: Record<string, unknown>) => ({
+  orderId: '1',
+  clientOid: 'c1',
+  category: 'SPOT',
+  symbol: 'RAAPLUSDT',
+  orderType: 'limit',
+  side: 'buy',
+  price: '330.5',
+  qty: '0.1',
+  cumExecQty: '0',
+  cumExecValue: '0',
+  avgPrice: '0',
+  orderStatus: 'live',
+  feeDetail: [],
+  createdTime: '1789000000000',
+  updatedTime: '1789000001000',
+  ...o,
+})
+
+/** A connector whose v3 client is `v3` and whose classic client is `v2`. */
+function stub(
+  futures: Futures,
+  v3: Record<string, (...a: any[]) => any>,
+  v2: Record<string, (...a: any[]) => any> = {},
+) {
+  const ex = new BitgetExchange(futures, 'key', 's', 'p') as any
+  ex.checkLimits = async () => undefined
+  ex.orderClient = v3
+  ex.client = v2
+  return ex
+}
+
+const unified = {
+  getAccountSettingsV3: async () => ({
+    data: { accountMode: 'unified', holdMode: 'hedge_mode' },
+  }),
+}
+
+describe('bitget UTA — account mode', () => {
+  beforeEach(() => clearAccountModeCache())
+
+  it('reads unified/hybrid/upgrading as UTA and switching as classic', () => {
+    eq('unified', accountModeFromSettings({ accountMode: 'unified' }), 'uta')
+    eq('hybrid', accountModeFromSettings({ accountMode: 'hybrid' }), 'uta')
+    eq(
+      'upgrading',
+      accountModeFromSettings({ accountMode: 'upgrading' }),
+      'uta',
+    )
+    eq(
+      'switching',
+      accountModeFromSettings({ accountMode: 'switching' }),
+      'classic',
+    )
+    eq('empty', accountModeFromSettings({}), undefined)
+  })
+
+  it('a unified account is served from v3 assets', async () => {
+    const ex = stub(Futures.null, {
+      ...unified,
+      getAccountAssetsV3: async () => ({
+        data: {
+          assets: [
+            { coin: 'USDT', balance: '100', available: '80', locked: '20' },
+            { coin: 'rAAPL', balance: '0.5', available: '0.5', locked: '0' },
+          ],
+        },
+      }),
+    })
+    const res = await ex.getBalance()
+    eq('status', res.status, StatusEnum.ok)
+    eq('assets', res.data, [
+      { asset: 'USDT', free: 80, locked: 20 },
+      { asset: 'rAAPL', free: 0.5, locked: 0 },
+    ])
+  })
+
+  it('a classic refusal flips an undetermined key to v3 and retries there', async () => {
+    let classicCalls = 0
+    const ex = stub(
+      Futures.null,
+      {
+        // transport failure: settles nothing
+        getAccountSettingsV3: async () => {
+          throw new Error('socket hang up (no body)')
+        },
+        getAccountAssetsV3: async () => ({
+          data: { assets: [{ coin: 'USDT', balance: '5', available: '5' }] },
+        }),
+      },
+      {
+        getSpotAccountAssets: async () => {
+          classicCalls++
+          throw bitgetError('40084', UNIFIED_REFUSAL)
+        },
+      },
+    )
+    const res = await ex.getBalance()
+    eq('status', res.status, StatusEnum.ok)
+    eq('assets', res.data, [{ asset: 'USDT', free: 5, locked: 0 }])
+    eq('classic tried once', classicCalls, 1)
+    // the flip is remembered: no further classic call
+    await ex.getBalance()
+    eq('classic not retried', classicCalls, 1)
+  })
+
+  it('a classic account keeps the classic path', async () => {
+    const ex = stub(
+      Futures.null,
+      {
+        getAccountSettingsV3: async () => {
+          throw bitgetError('40085', 'not a unified account')
+        },
+      },
+      {
+        getSpotAccountAssets: async () => ({
+          code: '00000',
+          data: [{ coin: 'BTC', available: '1', locked: '0', frozen: '0' }],
+        }),
+      },
+    )
+    const res = await ex.getBalance()
+    eq('assets', res.data, [{ asset: 'BTC', free: 1, locked: 0 }])
+  })
+})
+
+describe('bitget UTA — orders', () => {
+  beforeEach(() => clearAccountModeCache())
+
+  describe('a Reality token order with nobody on the other side', () => {
+    const place = async (
+      side: 'BUY' | 'SELL',
+      book: { a: any[]; b: any[] } | Error,
+      reality = true,
+    ) => {
+      setRealitySymbols(reality ? ['RMCDUSDT'] : [])
+      const ex = stub(Futures.null, {
+        ...unified,
+        placeOrderV3: async (p: any) => ({
+          data: { orderId: '1', clientOid: p.clientOid },
+        }),
+        getOrderInfoV3: async () => ({ data: orderRow({}) }),
+        getOrderBookV3: async () => {
+          if (book instanceof Error) throw book
+          return { code: '00000', data: { ...book, ts: '1' } }
+        },
+      })
+      return ex.openOrder({
+        symbol: 'RMCDUSDT',
+        side,
+        quantity: 0.05,
+        price: 238.8,
+        newClientOrderId: 'c-liq',
+        type: 'LIMIT',
+      })
+    }
+
+    it('is placed, and carries a notice when the side it trades against is empty', async () => {
+      const buy = await place('BUY', { a: [], b: [[238.6, 1]] })
+      eq('buy status', buy.status, StatusEnum.ok)
+      eq(
+        'buy notice',
+        /no sellers on RMCDUSDT/.test(`${buy.data.notice}`),
+        true,
+      )
+      const sell = await place('SELL', { a: [[238.9, 1]], b: [] })
+      eq(
+        'sell notice',
+        /no buyers on RMCDUSDT/.test(`${sell.data.notice}`),
+        true,
+      )
+    })
+
+    it('carries no notice when the other side has orders, the book cannot be read, or the pair is not a Reality token', async () => {
+      eq(
+        'liquid',
+        (await place('BUY', { a: [[238.9, 1]], b: [] })).data.notice,
+        undefined,
+      )
+      const failed = await place('BUY', new Error('timeout'))
+      eq('book read failed: still placed', failed.status, StatusEnum.ok)
+      eq('book read failed: no notice', failed.data.notice, undefined)
+      eq(
+        'not reality',
+        (await place('BUY', { a: [], b: [] }, false)).data.notice,
+        undefined,
+      )
+    })
+  })
+
+  it('spot limit order on a Reality token goes to v3 place-order', async () => {
+    const sent: any[] = []
+    const ex = stub(Futures.null, {
+      ...unified,
+      placeOrderV3: async (p: any) => {
+        sent.push(p)
+        return { data: { orderId: '1', clientOid: p.clientOid } }
+      },
+      getOrderInfoV3: async () => ({ data: orderRow({}) }),
+    })
+    const res = await ex.openOrder({
+      symbol: 'RAAPLUSDT',
+      side: 'BUY',
+      quantity: 0.1,
+      price: 330.5,
+      newClientOrderId: 'c1',
+      type: 'LIMIT',
+    })
+    eq('status', res.status, StatusEnum.ok)
+    eq('payload', sent[0], {
+      category: 'SPOT',
+      symbol: 'RAAPLUSDT',
+      qty: '0.1',
+      side: 'buy',
+      orderType: 'limit',
+      price: '330.5',
+      timeInForce: 'gtc',
+      clientOid: 'c1',
+    })
+    eq(
+      'order',
+      [res.data.status, res.data.type, res.data.side],
+      ['NEW', 'LIMIT', 'BUY'],
+    )
+  })
+
+  it('hedge close-long is sell + posSide long; one-way close is reduceOnly', async () => {
+    const sent: any[] = []
+    const ex = stub(Futures.usdm, {
+      ...unified,
+      placeOrderV3: async (p: any) => {
+        sent.push(p)
+        return { data: { clientOid: p.clientOid } }
+      },
+      getOrderInfoV3: async () => ({
+        data: orderRow({ category: 'USDT-FUTURES', symbol: 'BTCUSDT' }),
+      }),
+    })
+    await ex.openOrder({
+      symbol: 'BTCUSDT',
+      side: 'SELL',
+      quantity: 0.01,
+      price: 60000,
+      newClientOrderId: 'h1',
+      type: 'LIMIT',
+      reduceOnly: true,
+      positionSide: PositionSide.LONG,
+      marginType: MarginType.ISOLATED,
+    })
+    await ex.openOrder({
+      symbol: 'BTCUSDC',
+      side: 'BUY',
+      quantity: 0.01,
+      price: 60000,
+      newClientOrderId: 'o1',
+      type: 'LIMIT',
+      reduceOnly: true,
+      positionSide: PositionSide.BOTH,
+    })
+    eq(
+      'hedge',
+      [
+        sent[0].category,
+        sent[0].side,
+        sent[0].posSide,
+        sent[0].reduceOnly,
+        sent[0].marginMode,
+      ],
+      ['USDT-FUTURES', 'sell', 'long', undefined, 'isolated'],
+    )
+    eq(
+      'one-way',
+      [
+        sent[1].category,
+        sent[1].side,
+        sent[1].posSide,
+        sent[1].reduceOnly,
+        sent[1].marginMode,
+      ],
+      ['USDC-FUTURES', 'buy', undefined, 'yes', 'crossed'],
+    )
+  })
+
+  it('a classic account picking a Reality token is told it needs UTA', async () => {
+    setRealitySymbols(['RAAPLUSDT'])
+    let placed = false
+    const ex = stub(
+      Futures.null,
+      {
+        getAccountSettingsV3: async () => {
+          throw bitgetError('40085', 'not a unified account')
+        },
+      },
+      {},
+    )
+    ex.orderClient.spotSubmitOrder = async () => {
+      placed = true
+    }
+    const res = await ex.openOrder({
+      symbol: 'RAAPLUSDT',
+      side: 'BUY',
+      quantity: 10,
+      price: 330,
+      newClientOrderId: 'c2',
+      type: 'MARKET',
+    })
+    eq('status', res.status, StatusEnum.notok)
+    eq('reason', res.reason, REALITY_NEEDS_UTA)
+    eq('not placed', placed, false)
+  })
+
+  // Superseded by spec 014: the unified line now carries the inverse
+  // perpetuals, and an inverse account's balance is read from it like any
+  // other. Only the classic delivery contracts stay off it.
+  it('a unified inverse account reads its margin coins from v3', async () => {
+    const ex = stub(Futures.coinm, {
+      ...unified,
+      getAccountAssetsV3: async () => ({
+        data: {
+          assets: [
+            { coin: 'BTC', balance: '0.5', available: '0.25', locked: '0.25' },
+          ],
+        },
+      }),
+    })
+    const res = await ex.getBalance()
+    eq('status', res.status, StatusEnum.ok)
+    eq('assets', res.data, [{ asset: 'BTC', free: 0.25, locked: 0.25 }])
+  })
+})
+
+describe('bitget UTA — conversions', () => {
+  it('market order price is the average fill; fees come from feeDetail', () => {
+    const o = convertUtaOrder(
+      orderRow({
+        orderType: 'market',
+        price: '0',
+        avgPrice: '331.2',
+        orderStatus: 'filled',
+        cumExecQty: '0.03',
+        cumExecValue: '9.936',
+        feeDetail: [{ feeCoin: 'rAAPL', fee: '-0.00003' }],
+      }) as any,
+    )
+    eq(
+      'fields',
+      [
+        o.price,
+        o.status,
+        o.type,
+        o.executedQty,
+        o.cummulativeQuoteQty,
+        o.feePaid,
+        o.feeAsset,
+      ],
+      ['331.2', 'FILLED', 'MARKET', '0.03', '9.936', '0.00003', 'RAAPL'],
+    )
+    eq('spot has no position side', o.positionSide, undefined)
+  })
+
+  it('futures orders carry position side from holdMode/posSide', () => {
+    const hedge = convertUtaOrder(
+      orderRow({
+        category: 'USDT-FUTURES',
+        holdMode: 'hedge_mode',
+        posSide: 'short',
+        side: 'buy',
+        reduceOnly: 'YES',
+        orderStatus: 'cancelled',
+      }) as any,
+    )
+    const oneWay = convertUtaOrder(
+      orderRow({
+        category: 'USDT-FUTURES',
+        holdMode: 'one_way_mode',
+        posSide: 'long',
+        orderStatus: 'partially_filled',
+      }) as any,
+    )
+    eq(
+      'hedge',
+      [hedge.positionSide, hedge.side, hedge.reduceOnly, hedge.status],
+      ['SHORT', 'BUY', true, 'CANCELED'],
+    )
+    eq(
+      'one-way',
+      [oneWay.positionSide, oneWay.status],
+      ['BOTH', 'PARTIALLY_FILLED'],
+    )
+  })
+
+  it('free + locked is the balance, and futures keeps only margin coins', () => {
+    eq(
+      'partition',
+      convertUtaAssets(
+        [
+          { coin: 'USDT', balance: '1000', available: '600', locked: '50' },
+          { coin: 'BTC', balance: '1', available: '1' },
+        ],
+        ['USDT', 'USDC'],
+      ),
+      [{ asset: 'USDT', free: 600, locked: 400 }],
+    )
+  })
+
+  // Spec 030. Figures from a live COIN-M account with a resting DCA ladder:
+  // balance and equity both shrank to the unreserved part; the account's USD
+  // totalEquity is the venue's own total (Est. value 0.007488 BTC).
+  it('a resting ladder does not shrink the total: totalEquity carries it', () => {
+    const ladder = {
+      coin: 'BTC',
+      balance: '0.00088924',
+      equity: '0.00088924',
+      locked: '0.00587569',
+      available: '-0.00498646',
+      usdValue: '75.3740391',
+    }
+    const [btc] = convertUtaAssets([ladder], undefined, '634.73')
+    eq('free', btc.free, 0)
+    eq('total', +(btc.free + btc.locked).toFixed(7), 0.0074884)
+    eq('no account total keeps the coin figures', convertUtaAssets([ladder]), [
+      { asset: 'BTC', free: 0, locked: 0.00088924 },
+    ])
+    eq(
+      'cent rounding is not held funds',
+      convertUtaAssets(
+        [
+          {
+            coin: 'USDT',
+            balance: '0.98',
+            available: '0.98',
+            usdValue: '0.97976181',
+          },
+        ],
+        ['USDT', 'USDC'],
+        '0.97',
+      ),
+      [{ asset: 'USDT', free: 0.98, locked: 0 }],
+    )
+  })
+
+  it('open P&L stays out of the total, as on the classic futures path', () => {
+    const [btc] = convertUtaAssets(
+      [{ coin: 'BTC', balance: '0.001', available: '0', usdValue: '100' }],
+      undefined,
+      '350',
+      '50',
+    )
+    eq('total', +(btc.free + btc.locked).toFixed(8), 0.003)
+  })
+
+  it('held funds are not split between several coins', () => {
+    eq(
+      'two candidates',
+      convertUtaAssets(
+        [
+          {
+            coin: 'BTC',
+            balance: '0.001',
+            available: '0.001',
+            usdValue: '100',
+          },
+          { coin: 'ETH', balance: '0.1', available: '0.1', usdValue: '300' },
+        ],
+        undefined,
+        '1000',
+      ),
+      [
+        { asset: 'BTC', free: 0.001, locked: 0 },
+        { asset: 'ETH', free: 0.1, locked: 0 },
+      ],
+    )
+    eq(
+      'USDT-M: the one margin coin holds it, spot coins still count toward the excess',
+      convertUtaAssets(
+        [
+          { coin: 'USDT', balance: '100', available: '100', usdValue: '100' },
+          {
+            coin: 'BTC',
+            balance: '0.001',
+            available: '0.001',
+            usdValue: '100',
+          },
+        ],
+        ['USDT', 'USDC'],
+        '500',
+      ),
+      [{ asset: 'USDT', free: 100, locked: 300 }],
+    )
+  })
+
+  it('Reality candles come from a UTC-aligned native interval', () => {
+    eq(
+      'base',
+      [
+        ExchangeIntervals.oneM,
+        ExchangeIntervals.threeM,
+        ExchangeIntervals.thirtyM,
+        ExchangeIntervals.twoH,
+        ExchangeIntervals.fourH,
+        ExchangeIntervals.eightH,
+        ExchangeIntervals.oneD,
+        ExchangeIntervals.oneW,
+      ].map((i) => [realityBaseInterval(i), realityGranularity(i)]),
+      [
+        ['1m', '1min'],
+        ['1m', '1min'],
+        ['15m', '15min'],
+        ['1h', '1h'],
+        ['4h', '4h'],
+        ['4h', '4h'],
+        ['4h', '4h'],
+        ['4h', '4h'],
+      ],
+    )
+  })
+
+  it('aggregates 4h candles into UTC days and Monday weeks', () => {
+    const H4 = 4 * 60 * 60 * 1000
+    // Monday 2026-09-14 00:00 UTC
+    const monday = Date.UTC(2026, 8, 14)
+    const bars = [...Array(18).keys()].map((k) => ({
+      time: monday - 2 * H4 + k * H4, // starts Sunday 16:00 (mid-day)
+      open: `${100 + k}`,
+      high: `${110 + k}`,
+      low: `${90 + k}`,
+      close: `${101 + k}`,
+      volume: '1',
+    }))
+    const days = aggregateCandles(bars, 24 * 60 * 60 * 1000)
+    const DAY = 24 * 60 * 60 * 1000
+    // Sunday 16:00–24:00 is a partial first day and is dropped.
+    eq(
+      'days',
+      days.map((d) => [d.time, d.open, d.high, d.low, d.close, d.volume]),
+      [
+        [monday, '102', '117', '92', '108', '6'],
+        [monday + DAY, '108', '123', '98', '114', '6'],
+        [monday + 2 * DAY, '114', '127', '104', '118', '4'],
+      ],
+    )
+    const weeks = aggregateCandles(bars, 7 * 24 * 60 * 60 * 1000, true)
+    eq(
+      'week start',
+      weeks.map((w) => w.time),
+      [monday],
+    )
+  })
+
+  // Spec 020 §1.1/§1.2 (bug #917). A leading partial bucket is dropped for
+  // the same reason whether or not the merge produced anything after it: its
+  // open/high/low are missing the start of the bar. The window below is the
+  // one measured against the live venue — an 8h bucket whose 4h base data
+  // starts four hours in — and it must yield nothing at all rather than a
+  // bar stamped at the bucket start that only holds its second half.
+  it('drops a leading partial bucket even when it is the only bucket', () => {
+    const H = 60 * 60 * 1000
+    const EIGHT_H = 8 * H
+    // 2026-09-22T08:00Z, an 8h boundary.
+    const bucket = Date.UTC(2026, 8, 22, 8)
+    const first = {
+      time: bucket,
+      open: '100',
+      high: '150',
+      low: '90',
+      close: '140',
+      volume: '1',
+    }
+    const second = {
+      time: bucket + 4 * H,
+      open: '200',
+      high: '210',
+      low: '190',
+      close: '205',
+      volume: '1',
+    }
+
+    eq(
+      'only the second half of the bucket',
+      aggregateCandles([second], EIGHT_H),
+      [],
+    )
+    // The whole bucket still merges, and a trailing partial is still kept.
+    eq(
+      'the whole bucket',
+      aggregateCandles([first, second], EIGHT_H).map((c) => [
+        c.time,
+        c.open,
+        c.high,
+        c.low,
+        c.close,
+        c.volume,
+      ]),
+      [[bucket, '100', '210', '90', '205', '2']],
+    )
+    eq(
+      'a bucket open at its start is not partial',
+      aggregateCandles([first], EIGHT_H).map((c) => [c.time, c.open, c.close]),
+      [[bucket, '100', '140']],
+    )
+  })
+})
+
+describe('bitget spot exchange info — Reality tokens are listed as stocks', () => {
+  it('lists rTokens with assetClass stock and keeps other stock rows out', async () => {
+    const ex = stub(
+      Futures.null,
+      {
+        getInstrumentsV3: async () => ({
+          code: '00000',
+          data: [
+            { symbol: 'RAAPLUSDT', symbolType: 'stock', isReality: 'yes' },
+            { symbol: 'PREOPAIUSDT', symbolType: 'stock', isReality: 'no' },
+            { symbol: 'BTCUSDT', symbolType: 'crypto', isReality: 'no' },
+          ],
+        }),
+      },
+      {
+        getSpotTicker: async () => ({ code: '00000', data: [] }),
+        getSpotSymbolInfo: async () => ({
+          code: '00000',
+          data: ['RAAPLUSDT', 'PREOPAIUSDT', 'BTCUSDT'].map((symbol) => ({
+            symbol,
+            status: 'online',
+            baseCoin: symbol.replace('USDT', ''),
+            quoteCoin: 'USDT',
+            minTradeAmount: '0',
+            maxTradeAmount: '0',
+            quantityPrecision: '4',
+            quotePrecision: '6',
+            minTradeUSDT: '10',
+            orderQuantity: '200',
+            pricePrecision: '2',
+            makerFeeRate: '0.001',
+            takerFeeRate: '0.001',
+            sellLimitPriceRatio: '0.1',
+            buyLimitPriceRatio: '0.1',
+          })),
+        }),
+      },
+    )
+    const res = await ex.getAllExchangeInfo()
+    eq(
+      'pairs',
+      res.data.map((p: any) => [p.pair, p.assetClass]),
+      [
+        ['RAAPLUSDT', 'stock'],
+        ['BTCUSDT', 'crypto'],
+      ],
+    )
+  })
+
+  it('carries the underlying ticker only for rows Bitget flags isReality', async () => {
+    const base: Record<string, string> = {
+      RAAPLUSDT: 'rAAPL',
+      RTUSDT: 'rT', // AT&T: a one-letter ticker
+      RSRUSDT: 'RSR', // crypto that merely starts with R
+    }
+    const ex = stub(
+      Futures.null,
+      {
+        getInstrumentsV3: async () => ({
+          code: '00000',
+          data: [
+            { symbol: 'RAAPLUSDT', symbolType: 'stock', isReality: 'yes' },
+            { symbol: 'RTUSDT', symbolType: 'stock', isReality: 'yes' },
+            { symbol: 'RSRUSDT', symbolType: 'crypto', isReality: 'no' },
+          ],
+        }),
+      },
+      {
+        getSpotTicker: async () => ({ code: '00000', data: [] }),
+        getSpotSymbolInfo: async () => ({
+          code: '00000',
+          data: Object.keys(base).map((symbol) => ({
+            symbol,
+            status: 'online',
+            baseCoin: base[symbol],
+            quoteCoin: 'USDT',
+            minTradeAmount: '0',
+            maxTradeAmount: '0',
+            quantityPrecision: '4',
+            quotePrecision: '6',
+            minTradeUSDT: '10',
+            orderQuantity: '200',
+            pricePrecision: '2',
+            makerFeeRate: '0.001',
+            takerFeeRate: '0.001',
+            sellLimitPriceRatio: '0.1',
+            buyLimitPriceRatio: '0.1',
+          })),
+        }),
+      },
+    )
+    const res = await ex.getAllExchangeInfo()
+    eq(
+      'underlying',
+      res.data.map((p: any) => [p.pair, p.underlying]),
+      [
+        ['RAAPLUSDT', 'AAPL'],
+        ['RTUSDT', 'T'],
+        ['RSRUSDT', undefined],
+      ],
+    )
+  })
+})
+
+describe('bitget UTA — fees', () => {
+  beforeEach(() => clearAccountModeCache())
+
+  /** Spot pairs for a listing, shaped as `getSpotSymbolInfo` returns them. */
+  const spotSymbols = (symbols: string[]) =>
+    symbols.map((symbol) => ({
+      symbol,
+      status: 'online',
+      baseCoin: symbol.replace('USDT', ''),
+      quoteCoin: 'USDT',
+      minTradeAmount: '0',
+      maxTradeAmount: '0',
+      quantityPrecision: '4',
+      quotePrecision: '6',
+      minTradeUSDT: '10',
+      orderQuantity: '200',
+      pricePrecision: '2',
+      makerFeeRate: '0.001',
+      takerFeeRate: '0.001',
+      sellLimitPriceRatio: '0.1',
+      buyLimitPriceRatio: '0.1',
+    }))
+
+  it('stops the classic fee fan-out at the first refusal and answers from v3', async () => {
+    const symbols = Array.from({ length: 24 }, (_, i) => `C${i}USDT`)
+    let tradeRateCalls = 0
+    const ex = stub(
+      Futures.null,
+      {
+        // transport failure: the mode is undetermined, so classic runs first
+        getAccountSettingsV3: async () => {
+          throw new Error('socket hang up (no body)')
+        },
+        getInstrumentsV3: async () => ({ code: '00000', data: [] }),
+        getAllFeeRatesV3: async () => ({
+          code: '00000',
+          data: symbols.map((symbol) => ({
+            symbol,
+            makerFeeRate: '0.0002',
+            takerFeeRate: '0.0004',
+          })),
+        }),
+      },
+      {
+        getSpotTicker: async () => ({ code: '00000', data: [] }),
+        getSpotSymbolInfo: async () => ({
+          code: '00000',
+          data: spotSymbols(symbols),
+        }),
+        getTradeRate: async () => {
+          tradeRateCalls++
+          throw bitgetError('40084', UNIFIED_REFUSAL)
+        },
+      },
+    )
+
+    const res = await ex.getAllUserFees()
+    eq('status', res.status, StatusEnum.ok)
+    eq('pairs priced', res.data.length, symbols.length)
+    eq('v3 rates', res.data[0], {
+      pair: 'C0USDT',
+      maker: 0.0002,
+      taker: 0.0004,
+    })
+    // one chunk of 8, not one refused call per listed pair
+    if (tradeRateCalls > 8) {
+      throw new Error(`classic fan-out kept going: ${tradeRateCalls} calls`)
+    }
+  })
+
+  it("a key without the unified permissions is told to edit it, not Bitget's wording", async () => {
+    const ex = stub(Futures.null, {
+      ...unified,
+      getAllFeeRatesV3: async () => {
+        throw bitgetError(
+          '40014',
+          'incorrect permissions, need uta manage read or uta manage write permissions',
+        )
+      },
+      getInstrumentsV3: async () => ({ code: '00000', data: [] }),
+    })
+    ex.spot_getAllExchangeInfo = async () =>
+      ex.returnGood(ex.getEmptyTimeProfile())([
+        { pair: 'BTCUSDT', makerFee: 0.001, takerFee: 0.001 },
+      ])
+    const res = await ex.getAllUserFees()
+    eq('status', res.status, StatusEnum.notok)
+    eq('reason', res.reason, UTA_MISSING_PERMISSIONS)
+  })
+
+  /**
+   * A classic key the venue refuses as a key (IP not allow-listed, key deleted,
+   * wrong secret, restricted account) is refused for every pair alike, so the
+   * fan-out must stop at the first answer instead of asking once per listing.
+   */
+  const classicFeeFanOut = (
+    futures: Futures,
+    tradeRate: (symbol: string) => unknown,
+  ) => {
+    const listing = Array.from({ length: 24 }, (_, i) => ({
+      pair: `C${i}USDT`,
+      makerFee: 0.001,
+      takerFee: 0.001,
+    }))
+    const calls: string[] = []
+    const ex = stub(
+      futures,
+      {
+        // a venue answer with a body code: the key is classic
+        getAccountSettingsV3: async () => {
+          throw bitgetError('40018', 'invalid ip,current request ip 1.2.3.4')
+        },
+      },
+      {
+        getTradeRate: async ({ symbol }: { symbol: string }) => {
+          calls.push(symbol)
+          return tradeRate(symbol)
+        },
+      },
+    )
+    const listed = async () => ex.returnGood(ex.getEmptyTimeProfile())(listing)
+    ex.spot_getAllExchangeInfo = listed
+    ex.futures_getAllExchangeInfo = listed
+    return { ex, calls, listing }
+  }
+
+  for (const [futures, code, msg] of [
+    [Futures.null, '40018', 'invalid ip,current request ip 1.2.3.4'],
+    [Futures.null, '40037', 'apikey does not exist'],
+    [Futures.null, '40009', 'sign signature error'],
+    [Futures.usdm, '40037', 'apikey does not exist'],
+    [Futures.usdm, '40018', 'invalid ip,current request ip 1.2.3.4'],
+    [Futures.usdm, '40014', 'user status is abnormal'],
+  ] as const) {
+    it(`${futures === Futures.null ? 'spot' : 'futures'}: "${msg}" stops the fee fan-out and is the call's result`, async () => {
+      const { ex, calls } = classicFeeFanOut(futures, () => {
+        throw bitgetError(code, msg)
+      })
+      const res = await ex.getAllUserFees()
+      eq('status', res.status, StatusEnum.notok)
+      eq('reason', res.reason, msg)
+      if (calls.length > 8) {
+        throw new Error(`fan-out kept going: ${calls.length} calls`)
+      }
+    })
+  }
+
+  it('a per-symbol refusal still falls back to the listed rate for that pair only', async () => {
+    const { ex, calls, listing } = classicFeeFanOut(Futures.usdm, (symbol) => {
+      if (symbol === 'C3USDT') {
+        throw bitgetError('40034', 'parameter c3usdt does not exist')
+      }
+      return {
+        code: '00000',
+        data: { makerFeeRate: '0.0002', takerFeeRate: '0.0006' },
+      }
+    })
+    const res = await ex.getAllUserFees()
+    eq('status', res.status, StatusEnum.ok)
+    eq('every pair asked', calls.length, listing.length)
+    eq('pairs priced', res.data.length, listing.length)
+    const byPair = new Map(res.data.map((f) => [f.pair, f]))
+    eq('refused pair', byPair.get('C3USDT'), {
+      pair: 'C3USDT',
+      maker: 0.001,
+      taker: 0.001,
+    })
+    eq('account rate', byPair.get('C0USDT'), {
+      pair: 'C0USDT',
+      maker: 0.0002,
+      taker: 0.0006,
+    })
+  })
+})
+
+/**
+ * Spec 014 — Bitget's inverse perpetuals live only on the unified line, under
+ * a `_CM` name, sized in whole 1-USD contracts. The platform keeps its own
+ * name and its own unit (the base coin) on both sides of that boundary.
+ */
+describe('bitget UTA — inverse perpetuals', () => {
+  beforeEach(() => clearAccountModeCache())
+
+  const perpInstrument = {
+    symbol: 'BTCUSD_CM',
+    category: 'COIN-FUTURES',
+    baseCoin: 'BTC',
+    quoteCoin: 'USD',
+    symbolType: 'crypto',
+    type: 'perpetual',
+    status: 'online',
+    minOrderQty: '1',
+    minOrderAmount: '5',
+    pricePrecision: '1',
+    priceMultiplier: '0.1',
+    quantityPrecision: '0',
+    makerFeeRate: '0.0002',
+    takerFeeRate: '0.0006',
+    sellLimitPriceRatio: '0.05',
+    buyLimitPriceRatio: '0.05',
+    maxProductOrderNum: '400',
+    maxSymbolOrderNum: '',
+    minLeverage: '1',
+    maxLeverage: '125',
+  }
+
+  const deliveryContract = {
+    symbol: 'BTCUSDU26',
+    symbolStatus: 'normal',
+    baseCoin: 'BTC',
+    quoteCoin: 'USD',
+    minTradeNum: '0.001',
+    volumePlace: '3',
+    sizeMultiplier: '0.001',
+    minTradeUSDT: '5',
+    maxSymbolOrderNum: '200',
+    pricePlace: '1',
+    priceEndStep: '1',
+    minLever: '1',
+    maxLever: '50',
+    makerFeeRate: '0.0002',
+    takerFeeRate: '0.0006',
+    sellLimitPriceRatio: '0.05',
+    buyLimitPriceRatio: '0.05',
+    supportMarginCoins: ['BTC'],
+  }
+
+  const perpOrder = (o: Record<string, unknown> = {}) => ({
+    orderId: '9',
+    clientOid: 'c9',
+    category: 'COIN-FUTURES',
+    symbol: 'BTCUSD_CM',
+    orderType: 'limit',
+    side: 'buy',
+    price: '80000',
+    qty: '800',
+    cumExecQty: '0',
+    cumExecValue: '0',
+    avgPrice: '0',
+    orderStatus: 'live',
+    holdMode: 'one_way_mode',
+    feeDetail: [],
+    createdTime: '1789900000000',
+    updatedTime: '1789900001000',
+    ...o,
+  })
+
+  it('lists inverse perpetuals from v3 beside the classic delivery contracts', async () => {
+    const ex = stub(
+      Futures.coinm,
+      {
+        getInstrumentsV3: async () => ({
+          code: '00000',
+          data: [
+            perpInstrument,
+            { ...perpInstrument, symbol: 'OLDUSD_CM', status: 'offline' },
+          ],
+        }),
+      },
+      {
+        getFuturesContractConfig: async () => ({
+          code: '00000',
+          data: [deliveryContract],
+        }),
+      },
+    )
+    const res = await ex.getAllExchangeInfo()
+    eq('status', res.status, StatusEnum.ok)
+    eq(
+      'pairs',
+      res.data.map((p: any) => p.pair),
+      ['BTCUSDU26', 'BTCUSD'],
+    )
+    const perp = res.data[1]
+    eq('margined in the coin', perp.marginCoins, ['BTC'])
+    eq('venue minimum notional', perp.quoteAsset.minAmount, 5)
+    // a base step of 0 would read as "whole coins only" downstream
+    eq('base step', perp.baseAsset.step, 0.00000001)
+    eq('price step', perp.priceMultiplier.decimals, 0.1)
+  })
+
+  it('sends a perpetual as _CM, sized in whole 1-USD contracts', async () => {
+    let placed: Record<string, string> = {}
+    const ex = stub(Futures.coinm, {
+      ...unified,
+      placeOrderV3: async (o: Record<string, string>) => {
+        placed = o
+        return { data: { clientOid: 'c9' } }
+      },
+      getOrderInfoV3: async () => ({ data: perpOrder() }),
+    })
+    const res = await ex.openOrder({
+      symbol: 'BTCUSD',
+      side: 'BUY',
+      quantity: 0.01,
+      price: 80000,
+      type: 'LIMIT',
+      newClientOrderId: 'c9',
+    })
+    eq('category', placed.category, 'COIN-FUTURES')
+    eq('venue symbol', placed.symbol, 'BTCUSD_CM')
+    eq('contracts', placed.qty, '800')
+    eq('status', res.status, StatusEnum.ok)
+    // and the answer comes back in the platform's own name and unit
+    eq('pair', res.data.symbol, 'BTCUSD')
+    eq('base quantity', res.data.origQty, '0.01')
+  })
+
+  it("a Basic-mode account is told to switch to Advanced, not Bitget's wording", async () => {
+    const ex = stub(Futures.coinm, {
+      ...unified,
+      placeOrderV3: async () => {
+        // Prod, 2026-09-24: the venue's whole answer to an inverse order
+        // from a unified account still in Basic mode.
+        throw bitgetError(
+          '40019',
+          'the data is not existbasemode not supported',
+        )
+      },
+    })
+    const res = await ex.openOrder({
+      symbol: 'BTCUSD',
+      side: 'BUY',
+      quantity: 0.0003,
+      price: 84111.7,
+      type: 'LIMIT',
+      newClientOrderId: 'c10',
+    })
+    eq('status', res.status, StatusEnum.notok)
+    eq('reason', res.reason, UTA_BASIC_MODE_UNSUPPORTED)
+  })
+
+  it('a market order with no price of its own is sized from the venue', async () => {
+    let placed: Record<string, string> = {}
+    const ex = stub(Futures.coinm, {
+      ...unified,
+      getTickersV3: async () => ({
+        code: '00000',
+        data: [{ symbol: 'BTCUSD_CM', lastPrice: '50000' }],
+      }),
+      placeOrderV3: async (o: Record<string, string>) => {
+        placed = o
+        return { data: { clientOid: 'c9' } }
+      },
+      getOrderInfoV3: async () => ({
+        data: perpOrder({ orderType: 'market', price: '0', qty: '500' }),
+      }),
+    })
+    const res = await ex.openOrder({
+      symbol: 'BTCUSD',
+      side: 'SELL',
+      quantity: 0.01,
+      price: 0,
+      type: 'MARKET',
+      newClientOrderId: 'c9',
+    })
+    eq('contracts', placed.qty, '500')
+    eq('status', res.status, StatusEnum.ok)
+  })
+
+  it('a live fill: the venue quotes the contracts in both fields', async () => {
+    // Verbatim from production (2026-09-23): a filled BTCUSD_CM order for 120
+    // contracts reports qty, cumExecQty AND cumExecValue as 120. A cheap
+    // contract — DOGEUSD at $0.20 — reports the same shape, where reading the
+    // pair of figures as two different currencies would answer "base" and
+    // hand the platform 120 DOGE instead of 600 USD worth.
+    const ex = stub(Futures.coinm, {
+      ...unified,
+      getOrderInfoV3: async () => ({
+        data: perpOrder({
+          qty: '120',
+          cumExecQty: '120',
+          cumExecValue: '120',
+          avgPrice: '84350.2',
+          orderStatus: 'filled',
+          feeDetail: [{ feeCoin: 'BTC', fee: '0.0000002845280747' }],
+        }),
+      }),
+    })
+    const res = await ex.getOrder({ symbol: 'BTCUSD', orderId: '9' })
+    eq('pair', res.data.symbol, 'BTCUSD')
+    eq('base quantity', res.data.executedQty, `${120 / 84350.2}`)
+    eq('traded notional', res.data.cummulativeQuoteQty, '120')
+
+    const cheap = stub(Futures.coinm, {
+      ...unified,
+      getOrderInfoV3: async () => ({
+        data: perpOrder({
+          symbol: 'DOGEUSD_CM',
+          qty: '120',
+          cumExecQty: '120',
+          cumExecValue: '120',
+          avgPrice: '0.2',
+          orderStatus: 'filled',
+        }),
+      }),
+    })
+    const res2 = await cheap.getOrder({ symbol: 'DOGEUSD', orderId: '9' })
+    eq('base quantity', res2.data.executedQty, '600')
+  })
+
+  it('reads quantity back in base, from whichever unit the venue agrees with', async () => {
+    const ex = stub(Futures.coinm, {
+      ...unified,
+      // the venue's own figures say this qty is the base coin:
+      // 0.01 * 80000 === 800
+      getOrderInfoV3: async () => ({
+        data: perpOrder({
+          qty: '0.01',
+          cumExecQty: '0.01',
+          cumExecValue: '800',
+          avgPrice: '80000',
+          orderStatus: 'filled',
+        }),
+      }),
+    })
+    const res = await ex.getOrder({ symbol: 'BTCUSD', orderId: '9' })
+    eq('left alone', res.data.executedQty, '0.01')
+    eq('pair', res.data.symbol, 'BTCUSD')
+
+    const contracts = stub(Futures.coinm, {
+      ...unified,
+      // and here they say it is contracts: 800 / 80000 === 0.01
+      getOrderInfoV3: async () => ({
+        data: perpOrder({
+          qty: '800',
+          cumExecQty: '800',
+          cumExecValue: '0.01',
+          avgPrice: '80000',
+          orderStatus: 'filled',
+        }),
+      }),
+    })
+    const res2 = await contracts.getOrder({ symbol: 'BTCUSD', orderId: '9' })
+    eq('converted', res2.data.executedQty, '0.01')
+    eq('traded notional', res2.data.cummulativeQuoteQty, '800')
+  })
+
+  it('positions come back in the base coin, under the platform name', async () => {
+    const ex = stub(Futures.coinm, {
+      ...unified,
+      getCurrentPositionsV3: async () => ({
+        data: [
+          {
+            symbol: 'BTCUSD_CM',
+            posSide: 'long',
+            holdMode: 'one_way_mode',
+            marginMode: 'crossed',
+            positionBalance: '0.01',
+            total: '800',
+            leverage: '10',
+            avgPrice: '80000',
+            unrealisedPnl: '0.0001',
+            updatedTime: '1789900001000',
+          },
+        ],
+      }),
+    })
+    const res = await ex.futures_getPositions('BTCUSD')
+    eq('pair', res.data[0].symbol, 'BTCUSD')
+    eq('size in base', res.data[0].positionAmt, '0.01')
+  })
+
+  it('a delivery contract stays off the unified line', async () => {
+    const ex = stub(Futures.coinm, {
+      ...unified,
+      placeOrderV3: async () => {
+        throw new Error('the delivery contract must never be sent to v3')
+      },
+    })
+    const res = await ex.openOrder({
+      symbol: 'BTCUSDU26',
+      side: 'BUY',
+      quantity: 0.01,
+      price: 80000,
+      type: 'LIMIT',
+    })
+    eq('status', res.status, StatusEnum.notok)
+    eq('reason', res.reason, UTA_COINM_UNSUPPORTED)
+  })
+
+  it('a classic key is told the perpetual needs a unified account', async () => {
+    const ex = stub(
+      Futures.coinm,
+      {
+        getAccountSettingsV3: async () => {
+          throw bitgetError('40085', 'not a unified account')
+        },
+      },
+      {
+        placeFuturesOrder: async () => {
+          throw new Error('classic cannot carry a perpetual any more')
+        },
+      },
+    )
+    const res = await ex.openOrder({
+      symbol: 'BTCUSD',
+      side: 'BUY',
+      quantity: 0.01,
+      price: 80000,
+      type: 'LIMIT',
+    })
+    eq('status', res.status, StatusEnum.notok)
+    eq('reason', res.reason, COINM_PERP_NEEDS_UTA)
+  })
+
+  it('candles come from v3, on the UTC-aligned granularity', async () => {
+    const asked: Record<string, string>[] = []
+    const ex = stub(Futures.coinm, {
+      ...unified,
+      getCandlesV3: async (params: Record<string, string>) => {
+        asked.push(params)
+        return {
+          code: '00000',
+          data: [
+            ['1789862400000', '80000', '81000', '79000', '80500', '1', '2'],
+          ],
+        }
+      },
+    })
+    const res = await ex.getCandles('BTCUSD', ExchangeIntervals.oneD)
+    eq('symbol', asked[0].symbol, 'BTCUSD_CM')
+    eq('granularity', asked[0].interval, '1Dutc')
+    eq('category', asked[0].category, 'COIN-FUTURES')
+    eq('candle', res.data[0], {
+      time: 1789862400000,
+      open: '80000',
+      high: '81000',
+      low: '79000',
+      close: '80500',
+      volume: '2',
+    })
+  })
+})
+
+/**
+ * Spec 027 — isolated leverage on a unified account. The venue keeps isolated
+ * leverage per position side; in hedge mode it wants both sides in one request
+ * and refuses a single `posSide` with the error prod logged.
+ */
+describe('bitget UTA — isolated leverage (spec 027)', () => {
+  beforeEach(() => clearAccountModeCache())
+
+  const DOUBLE_SIDE_HOLD =
+    'DOUBLE_SIDE_HOLD afterShortLeverage and afterLongLeverage none validation error'
+
+  /** A venue that records every set-leverage body and applies Bitget's rule. */
+  function venue(holdMode: 'hedge_mode' | 'one_way_mode', refuseAll = false) {
+    const calls: Record<string, unknown>[] = []
+    const ex = stub(Futures.usdm, {
+      getAccountSettingsV3: async () => ({
+        data: { accountMode: 'unified', holdMode },
+      }),
+      setLeverageV3: async (p: Record<string, unknown>) => {
+        calls.push(p)
+        if (p.marginMode === 'isolated') {
+          const pairOk =
+            holdMode === 'hedge_mode'
+              ? p.longLeverage !== undefined && p.shortLeverage !== undefined
+              : p.posSide !== undefined
+          if (refuseAll || !pairOk) {
+            throw bitgetError('40019', DOUBLE_SIDE_HOLD)
+          }
+        }
+        return { code: '00000', data: {} }
+      },
+    })
+    return { ex, calls }
+  }
+
+  it('§2.1 hedge mode: an isolated bot sets both sides in one request', async () => {
+    const { ex, calls } = venue('hedge_mode')
+    const res = await ex.futures_changeMarginType(
+      'BTCUSDT',
+      MarginType.ISOLATED,
+      2,
+    )
+    eq('status', res.status, StatusEnum.ok)
+    eq('calls', calls, [
+      {
+        category: 'USDT-FUTURES',
+        symbol: 'BTCUSDT',
+        marginMode: 'isolated',
+        longLeverage: '2',
+        shortLeverage: '2',
+      },
+    ])
+  })
+
+  it('§2.2 one-way mode: an isolated bot sets each side', async () => {
+    const { ex, calls } = venue('one_way_mode')
+    const res = await ex.futures_changeMarginType(
+      'BTCUSDT',
+      MarginType.ISOLATED,
+      2,
+    )
+    eq('status', res.status, StatusEnum.ok)
+    eq(
+      'calls',
+      calls.map((c) => [c.marginMode, c.leverage, c.posSide]),
+      [
+        ['isolated', '2', 'long'],
+        ['isolated', '2', 'short'],
+      ],
+    )
+  })
+
+  it('§2.3 an isolated bot is told when the venue refuses its leverage', async () => {
+    const { ex } = venue('hedge_mode', true)
+    const res = await ex.futures_changeMarginType(
+      'BTCUSDT',
+      MarginType.ISOLATED,
+      2,
+    )
+    eq('status', res.status, StatusEnum.notok)
+    if (!`${res.reason}`.toUpperCase().includes('DOUBLE_SIDE_HOLD')) {
+      throw new Error(`reason: ${res.reason}`)
+    }
+  })
+
+  it('§2.4 a cross bot touches no isolated leverage', async () => {
+    const { ex, calls } = venue('hedge_mode', true)
+    const res = await ex.futures_changeMarginType(
+      'BTCUSDT',
+      MarginType.CROSSED,
+      2,
+    )
+    eq('status', res.status, StatusEnum.ok)
+    eq('calls', calls.length, 0)
+  })
+
+  it('§2.5 changeLeverage sets cross, and isolated in the hold-mode shape', async () => {
+    const { ex, calls } = venue('hedge_mode')
+    const res = await ex.futures_changeLeverage('BTCUSDT', 2)
+    eq('status', res.status, StatusEnum.ok)
+    eq('data', res.data, 2)
+    eq(
+      'calls',
+      calls.map((c) => [c.marginMode, c.leverage, c.longLeverage, c.posSide]),
+      [
+        ['crossed', '2', undefined, undefined],
+        ['isolated', undefined, '2', undefined],
+      ],
+    )
+  })
+
+  it('§2.5 changeLeverage still answers the cross leverage if isolated is refused', async () => {
+    const { ex } = venue('hedge_mode', true)
+    const res = await ex.futures_changeLeverage('BTCUSDT', 2)
+    eq('status', res.status, StatusEnum.ok)
+    eq('data', res.data, 2)
+  })
+})
+
+/**
+ * Spec 028 — pooled collateral. A unified account in `multi_assets` mode
+ * margins an inverse contract from any coin in the wallet, so the connector
+ * reports the pool (USD) for callers whose per-coin check came up short.
+ */
+describe('bitget UTA — pooled collateral (spec 028)', () => {
+  beforeEach(() => clearAccountModeCache())
+
+  const pooled = { accountMode: 'unified', assetMode: 'multi_assets' }
+  const assets = { effEquity: '100.5', imr: '20.5', assets: [] }
+
+  it('§2.1 a multi_assets account reports effEquity less imr', () => {
+    eq('pool', pooledMarginFromUta(pooled, assets), 80)
+  })
+
+  it('§2.1 the pool never reads negative', () => {
+    eq('pool', pooledMarginFromUta(pooled, { effEquity: '10', imr: '15' }), 0)
+  })
+
+  it('§2.2 a unified account that is not multi_assets is not pooled', () => {
+    eq(
+      'single',
+      pooledMarginFromUta(
+        { accountMode: 'unified', assetMode: 'single' },
+        assets,
+      ),
+      null,
+    )
+    eq('absent', pooledMarginFromUta({ accountMode: 'unified' }, assets), null)
+  })
+
+  it('§2.2 an isolated account level is not pooled', () => {
+    eq(
+      'isolated',
+      pooledMarginFromUta({ ...pooled, accountLevel: 'isolated' }, assets),
+      null,
+    )
+  })
+
+  it('§2.2 a classic account is not pooled', () => {
+    eq(
+      'classic',
+      pooledMarginFromUta(
+        { accountMode: 'switching', assetMode: 'multi_assets' },
+        assets,
+      ),
+      null,
+    )
+  })
+
+  it('§2.2 an assets answer without effEquity is no answer', () => {
+    eq('missing', pooledMarginFromUta(pooled, { assets: [] }), null)
+  })
+
+  it('§2.3 a COIN-M connection on a pooled account reports the pool', async () => {
+    const ex = stub(Futures.coinm, {
+      getAccountSettingsV3: async () => ({ data: pooled }),
+      getAccountAssetsV3: async () => ({ data: assets }),
+    })
+    const res = await ex.getMarginAvailableUsd()
+    eq('status', res.status, StatusEnum.ok)
+    eq('data', res.data, 80)
+  })
+
+  it('§2.3 a non-pooled unified account never reads its assets', async () => {
+    let assetReads = 0
+    const ex = stub(Futures.coinm, {
+      getAccountSettingsV3: async () => ({
+        data: { accountMode: 'unified', assetMode: 'single' },
+      }),
+      getAccountAssetsV3: async () => {
+        assetReads++
+        return { data: assets }
+      },
+    })
+    const res = await ex.getMarginAvailableUsd()
+    eq('data', res.data, null)
+    eq('asset reads', assetReads, 0)
+  })
+
+  it('§2.4 a classic account answers null', async () => {
+    const ex = stub(Futures.coinm, {
+      getAccountSettingsV3: async () => {
+        throw bitgetError('40084', 'you are not in unified account mode')
+      },
+    })
+    const res = await ex.getMarginAvailableUsd()
+    eq('status', res.status, StatusEnum.ok)
+    eq('data', res.data, null)
+  })
+
+  it('§2.4 a spot connection answers null without asking the venue', async () => {
+    let reads = 0
+    const ex = stub(Futures.null, {
+      getAccountSettingsV3: async () => {
+        reads++
+        return { data: pooled }
+      },
+    })
+    const res = await ex.getMarginAvailableUsd()
+    eq('data', res.data, null)
+    eq('reads', reads, 0)
+  })
+})
+
+describe('bitget UTA — shared wallet', () => {
+  beforeEach(() => clearAccountModeCache())
+
+  it('a unified account shares one wallet across its legs', async () => {
+    const res = await stub(Futures.null, unified).getSharedWallet()
+    eq('status', res.status, StatusEnum.ok)
+    eq('shared', res.data, true)
+  })
+
+  it('a classic account keeps a wallet per product line', async () => {
+    const res = await stub(Futures.usdm, {
+      getAccountSettingsV3: async () => {
+        throw bitgetError('40084', UNIFIED_REFUSAL.replace('unified', 'x'))
+      },
+    }).getSharedWallet()
+    eq('shared', res.data, false)
+  })
+
+  it('a transport failure is undetermined, not classic', async () => {
+    const res = await stub(Futures.null, {
+      getAccountSettingsV3: async () => {
+        throw new Error('ETIMEDOUT')
+      },
+    }).getSharedWallet()
+    eq('status', res.status, StatusEnum.ok)
+    eq('shared', res.data, null)
+  })
+})

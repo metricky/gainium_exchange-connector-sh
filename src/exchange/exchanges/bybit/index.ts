@@ -51,8 +51,24 @@ import {
 } from 'bybit-api'
 import { RestClientV5 as BybitOrderClient } from '../../../bybit-custom/rest-client-v5'
 import limitHelper from './limit'
+import {
+  normalizeOrderFees,
+  normalizeSidedOrderFee,
+} from '../../helpers/orderFee'
 import { Logger } from '@nestjs/common'
 import { sleep } from '../../../utils/sleepUtils'
+import { keyFingerprint } from '../../../utils/keyFingerprint'
+import { pageCandleRange } from '../../helpers/candlePager'
+import { timeIntervalMap } from '../okx'
+
+/**
+ * Most bars `/v5/market/kline` serves in one call, on every category.
+ * MEASURED against the live API (spec 024 §2.2) — asking for 1500 returns
+ * 1000, silently, with `retCode: 0`. The single-call path below still asks for
+ * `countData || 200`: that is a caller's page size, not this cap, and every
+ * caller that passes a count relies on getting exactly what it asked for.
+ */
+const CANDLE_PAGE_SIZE = 1000
 
 class BybitError extends Error {
   code: number
@@ -344,7 +360,12 @@ class BybitExchange extends AbstractExchange implements Exchange {
       const coins = new Set(allPairs.data.map((p) => p.quoteAsset.name))
       timeProfile = this.startProfilerTime(timeProfile, 'exchange')
       for (const coin of coins) {
-        await this.client
+        // A settle coin that fails must fail the WHOLE read: returning the
+        // coins that did answer would hand the caller a short list stamped OK,
+        // and a missing symbol reads as a closed position. `symbol` is passed
+        // to the handler (undefined here) so its retry re-enters this branch
+        // instead of taking the TimeProfile as a symbol.
+        const failed = await this.client
           .getPositionInfo({ category, limit: 200, settleCoin: coin })
           .then(async (result) => {
             if (result.retMsg === 'OK') {
@@ -353,8 +374,24 @@ class BybitExchange extends AbstractExchange implements Exchange {
               )) {
                 data.push(await this.convertPosition(p))
               }
+              return null
             }
+            return this.handleBybitErrors<BaseReturn<PositionInfo[]>>(
+              this.futures_getPositions,
+              symbol,
+              this.endProfilerTime(timeProfile, 'exchange'),
+            )(new BybitError(result.retMsg, result.retCode))
           })
+          .catch(
+            this.handleBybitErrors<BaseReturn<PositionInfo[]>>(
+              this.futures_getPositions,
+              symbol,
+              this.endProfilerTime(timeProfile, 'exchange'),
+            ),
+          )
+        if (failed) {
+          return failed
+        }
       }
       timeProfile = this.endProfilerTime(timeProfile, 'exchange')
       return this.returnGood<PositionInfo[]>(timeProfile)(data)
@@ -1657,6 +1694,67 @@ class BybitExchange extends AbstractExchange implements Exchange {
     countData?: number,
     timeProfile = this.getEmptyTimeProfile(),
   ): Promise<BaseReturn<CandleResponse[]>> {
+    // A range read with no explicit count walks the venue until the window is
+    // covered. Without this the single call below returns one page — the
+    // NEWEST 200 bars, because `/v5/market/kline` anchors at `end` — for any
+    // range, silently (bug #923, spec 024).
+    //
+    // `from`/`to` are typed `number` and are NOT numbers at runtime: the
+    // controller binds them with `@Query` and no transforming pipe is
+    // installed (spec 023 §2.1). The pager is the first code here to ADD to
+    // them, and on a string that concatenates, so they are coerced into locals
+    // first. Locals, not reassignment: the single-call path below is left
+    // passing exactly what it passes today.
+    const fromMs = from == null ? from : +from
+    const toMs = to == null ? to : +to
+    const step = timeIntervalMap[interval]
+    if (fromMs && toMs && !countData && step > 0 && toMs > fromMs) {
+      try {
+        const candles = await pageCandleRange({
+          from: fromMs,
+          to: toMs,
+          step,
+          pageSize: CANDLE_PAGE_SIZE,
+          fetchPage: async (start, end, limit) => {
+            timeProfile =
+              (await this.checkLimits('getCandles', 'get', timeProfile)) ||
+              timeProfile
+            timeProfile = this.startProfilerTime(timeProfile, 'exchange')
+            const res = await this.client.getKline({
+              category: this.getCategory() as GetKlineParamsV5['category'],
+              symbol,
+              interval: this.convertInterval(interval),
+              start,
+              end,
+              limit,
+            })
+            timeProfile = this.endProfilerTime(timeProfile, 'exchange')
+            if (res.retMsg !== 'OK') {
+              throw new BybitError(res.retMsg, res.retCode)
+            }
+            return res.result.list.map((k) => ({
+              open: k[1],
+              close: k[4],
+              high: k[2],
+              low: k[3],
+              time: +k[0],
+              volume: k[5],
+            }))
+          },
+        })
+        return this.returnGood<CandleResponse[]>(timeProfile)(candles)
+      } catch (e) {
+        return this.handleBybitErrors(
+          this.getCandles,
+          symbol,
+          interval,
+          from,
+          to,
+          countData,
+          this.endProfilerTime(timeProfile, 'exchange'),
+        )(e)
+      }
+    }
     timeProfile =
       (await this.checkLimits('getCandles', 'get', timeProfile)) || timeProfile
     timeProfile = this.startProfilerTime(timeProfile, 'exchange')
@@ -1786,6 +1884,7 @@ class BybitExchange extends AbstractExchange implements Exchange {
     }
 
     return {
+      ...this.orderFee(order),
       symbol: order.symbol,
       orderId: order.orderId,
       clientOrderId: order.orderLinkId,
@@ -1815,6 +1914,45 @@ class BybitExchange extends AbstractExchange implements Exchange {
             : PositionSide.SHORT
         : undefined,
     }
+  }
+
+  /**
+   * The fee Bybit actually charged for an order.
+   *
+   * `cumExecFee` is the cumulative fee on the order record — an observation,
+   * not our own `qty * rate`. Bybit names the currency in two different ways
+   * depending on the account, so both are handled rather than assumed:
+   *
+   * - `cumFeeDetail` is a currency-keyed map, present on accounts where the
+   *   fee can be split (a fee-coin deduction alongside the settle coin). When
+   *   Bybit gives us the map it is the authoritative answer and needs no rule
+   *   at all, so it wins.
+   * - Otherwise the currency follows from the product, which is a venue
+   *   invariant rather than a guess. Derivatives fees settle in the settle
+   *   coin: quote for linear (USDT/USDC perps), base for inverse. Spot fees
+   *   come out of the asset RECEIVED — base on a buy, quote on a sell — which
+   *   is why the side is consulted here and not the pair string.
+   */
+  private orderFee(
+    order: AccountOrderV5 & { cumFeeDetail?: Record<string, string> },
+  ) {
+    const detail = order.cumFeeDetail
+    if (detail && typeof detail === 'object') {
+      const fromDetail = normalizeOrderFees(
+        Object.entries(detail).map(([asset, amount]) => ({ amount, asset })),
+      )
+      if (fromDetail.feePaid || fromDetail.feeBreakdown) {
+        return fromDetail
+      }
+    }
+    const feeSide: 'base' | 'quote' = this.futures
+      ? this.coinm
+        ? 'base'
+        : 'quote'
+      : order.side === 'Buy'
+        ? 'base'
+        : 'quote'
+    return normalizeSidedOrderFee(order.cumExecFee, feeSide)
   }
 
   private async convertPosition(position: PositionV5): Promise<PositionInfo> {
@@ -1924,7 +2062,7 @@ class BybitExchange extends AbstractExchange implements Exchange {
             Logger.log(
               `Bybit Too many visits wait ${time}s ${timeProfile.attempts} ${
                 cb.name
-              } ${this.key}`,
+              } key#${keyFingerprint(this.key)}`,
             )
             await sleep(time)
           }

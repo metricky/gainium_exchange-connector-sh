@@ -2,6 +2,8 @@ import AbstractExchange, { Exchange } from '../../abstractExchange'
 import {
   AllPricesResponse,
   BaseReturn,
+  BatchOpenOrder,
+  BatchOpenResult,
   CandleResponse,
   FundingRateResponse,
   CommonOrder,
@@ -34,8 +36,14 @@ import {
   DerivativesClient,
   krakenNonceFromError,
 } from '../../../kraken-custom'
-import limitHelper from './limit'
-import { krakenLadderFee } from './fees'
+import limitHelper, { krakenCancelCostForAge } from './limit'
+import { krakenLadderFee, krakenOrderFee } from './fees'
+import { krakenSpotFreeLocked } from './balance'
+import {
+  aggregateCandles,
+  krakenSpotCandleSource,
+  krakenSpotWindowIsUnreachable,
+} from './candles'
 import { Logger } from '@nestjs/common'
 import { createHash } from 'crypto'
 import { sleep } from '../../../utils/sleepUtils'
@@ -135,20 +143,11 @@ const KRAKEN_XSTOCK_ETFS = new Set<string>([
   'BITX',
 ])
 
-// Interval mapping for Kraken
-const intervalMap: { [x in ExchangeIntervals]: number } = {
-  '1m': 1,
-  '3m': 3,
-  '5m': 5,
-  '15m': 15,
-  '30m': 30,
-  '1h': 60,
-  '2h': 120,
-  '4h': 240,
-  '8h': 480,
-  '1d': 1440,
-  '1w': 10080,
-}
+// Interval mapping for Kraken spot lives in `./candles`
+// (`krakenSpotCandleSource`). It used to be a bare `interval -> minutes` map
+// here, which read like a capability map but was only a unit conversion: three
+// of its eleven entries (3m/2h/8h -> 3/120/480) are values /0/public/OHLC
+// rejects outright. See bug #709.
 
 /**
  * Singleton class to manage Kraken symbol mappings
@@ -422,6 +421,81 @@ const krakenPairFeeMapCache = new Map<
 const KRAKEN_TRADE_VOLUME_CHUNK = 50
 
 /**
+ * Txids per QueryOrders request. Kraken's documented ceiling is 50 unique ids,
+ * and the call costs one REST token regardless of how many it carries.
+ */
+const KRAKEN_QUERY_ORDERS_MAX = 50
+
+/**
+ * Unique ids per `CancelOrderBatch` request — Kraken's documented ceiling, and
+ * the same number as {@link KRAKEN_QUERY_ORDERS_MAX}, which is why one chunk
+ * size serves the read and the cancel that follows it.
+ */
+const KRAKEN_CANCEL_BATCH_MAX = 50
+
+/**
+ * Orders per `AddOrderBatch` request. Kraken's documented minimum and maximum,
+ * both enforced by the venue: it rejects a batch of 1 as well as a batch of 16,
+ * and validates the WHOLE batch before submitting any of it.
+ */
+const KRAKEN_ADD_BATCH_MIN = 2
+const KRAKEN_ADD_BATCH_MAX = 15
+
+/**
+ * The QueryOrders row fields this file reads. Kraken's payload carries far
+ * more; naming only these keeps the batch paths honest about what they depend
+ * on. `opentm` is the venue's own open timestamp in SECONDS since the epoch —
+ * the only thing that makes an age-scaled cancel cost computable, and present
+ * on every open/closed row in `@siebly/kraken-api`'s `SpotOpenOrder`.
+ */
+type KrakenSpotOrderRow = {
+  descr?: {
+    pair?: string
+    price?: string
+    ordertype?: string
+    type?: string
+  }
+  fee?: string
+  oflags?: string
+  price?: string
+  vol?: string
+  vol_exec?: string
+  status?: string
+  opentm?: number
+}
+
+/**
+ * The Kraken spot order statuses a cancel can still act on. `closed`,
+ * `canceled` and `expired` are terminal, and an order in one of them is
+ * deliberately left OUT of a bulk cancel: sending it wastes a slot and its
+ * semantics (a fill that raced the cancel, an id the venue no longer knows)
+ * belong to the per-order path, which has the unknown-order ladder for exactly
+ * that.
+ */
+const KRAKEN_CANCELLABLE_STATUSES = new Set(['open', 'pending'])
+
+/**
+ * Kraken's ceiling on the FREE-TEXT form of `cl_ord_id`, in characters.
+ *
+ * Kraken accepts a client order id as a long UUID (8-4-4-4-12 hex), a short
+ * UUID (32 hex, no dashes), or "free format ascii text up to 18 characters".
+ * Only the last one can carry an id we chose, so this length is what separates
+ * an id that can be sent verbatim from one that has to be encoded — and it is
+ * the same budget main-app generates Kraken spot ids inside
+ * (`main-app core/src/bot/main.ts` `KRAKEN_CL_ORD_ID_MAX_LENGTH`, spec 010).
+ */
+const KRAKEN_FREE_TEXT_CL_ORD_ID_MAX = 18
+
+/**
+ * How many times `checkLimits` will wait and re-ask the budget before letting
+ * the call through anyway. Each wait is the limiter's own estimate of when the
+ * counter admits it, so the normal case resolves on the first retry; the
+ * ceiling exists so a saturated account cannot hold a connector slot open
+ * indefinitely.
+ */
+const KRAKEN_LIMIT_WAIT_ATTEMPTS = 3
+
+/**
  * Last time an avg-fill-price lookup failure was logged, per
  * `<key fingerprint>:<class>`. A key that lacks the permission fails on EVERY
  * filled order, so logging each one would bury the signal it is meant to raise;
@@ -481,6 +555,11 @@ class KrakenExchange extends AbstractExchange implements Exchange {
   protected futures?: Futures
   /** Symbol mapper for converting between our format and Kraken's format */
   private symbolMapper: KrakenSymbolMapper
+  /**
+   * Kraken API Partner ID (IIBAN), sent as `broker` on order placement. Kraken
+   * only accepts the exact IIBAN, spaces included (`AAAA BBBB CCCC DDDD`).
+   */
+  protected broker?: string
 
   constructor(
     futures: Futures,
@@ -490,11 +569,17 @@ class KrakenExchange extends AbstractExchange implements Exchange {
     _environment?: string,
     _keysType?: unknown,
     _okxSource?: string,
-    _code?: string,
+    code?: string,
     _bybitHost?: unknown,
     _subaccount?: boolean,
   ) {
     super({ key, secret })
+
+    const broker = code?.trim().replace(/\s+/g, ' ').toUpperCase()
+    this.broker =
+      broker && /^[A-Z0-9]{4}( [A-Z0-9]{4}){3}$/.test(broker)
+        ? broker
+        : undefined
 
     const isDemo = process.env.KRAKEN_ENV === 'demo'
 
@@ -540,7 +625,7 @@ class KrakenExchange extends AbstractExchange implements Exchange {
       // ever matched it — public `/public/OHLC` rejections were thrown straight
       // through with no backoff at all, and the archive backfiller simply
       // re-requested, so the egress fleet hammered Kraken continuously
-      // (2026-07-28: 142 of 145 error lines on a single node, 0 retries logged).
+      // (nearly every error line on an affected node, with 0 retries logged).
       'EGeneral:Too many requests',
       // Nonce collisions (spot `EAPI:Invalid nonce`; futures lowercase
       // `invalid nonce` / `duplicate nonce`) are pre-execution rejections — the
@@ -765,7 +850,38 @@ class KrakenExchange extends AbstractExchange implements Exchange {
         ['500', '502', '503', '504', '520', '521', '522'].includes(
           String(httpStatus),
         )
-      const maxAttempts = isRateLimit || isProviderOutage ? 3 : this.retry
+      // A LOCKOUT is not a transient to ride out — it is Kraken telling us to
+      // stop, and it is the one error class where retrying actively makes the
+      // situation worse: Kraken EXTENDS a temporary lockout on further
+      // requests, so a ladder converts a fixed penalty into an open-ended one.
+      // It was nonetheless on the generic ladder (10 attempts, 1s->10s = ~74s
+      // of hammering), and because the ramp is per-request state that resets
+      // on every new call, each caller kept starting a fresh one.
+      //
+      // 2026-08-28 (#543): three episodes drove single order ids 20-90
+      // getOrder calls deep — ~15x the caller's own ceiling — because the
+      // connector's ladder multiplies with main-app's unknown-order ladder.
+      // 740 lockout lines in ~50 minutes, none of them behind a restart or a
+      // deploy. Zero attempts is the only depth that cannot extend the
+      // penalty; the caller's own loop retries later, by which time the
+      // lockout has expired on its own.
+      const isLockout = matches(['EGeneral:Temporary lockout'])
+      // A nonce rejection happens before execution, so re-signing is safe — but
+      // each rejected attempt is also a strike toward the lockout above. The
+      // 10-attempt ladder let one burst of out-of-order arrivals put dozens of
+      // strikes on a single key. Requests on one key are now signed and sent in
+      // order (`inKrakenKeyOrder`), so what is left is rare and a few attempts
+      // clear it.
+      const isNonce = matches([
+        'EAPI:Invalid nonce',
+        'invalid nonce',
+        'duplicate nonce',
+      ])
+      const maxAttempts = isLockout
+        ? 0
+        : isRateLimit || isProviderOutage || isNonce
+          ? 3
+          : this.retry
 
       if (shouldRetry && timeProfile.attempts < maxAttempts) {
         const waitTime = isRateLimit
@@ -795,13 +911,30 @@ class KrakenExchange extends AbstractExchange implements Exchange {
     method: string,
     symbol?: string,
     timeProfile?: TimeProfile,
+    /**
+     * Set by the BULK paths only. A batch is one REST call whose
+     * matching-engine cost is the caller's to compute (orders in the batch for
+     * an add; the summed age-scaled cancel costs for a cancel), so it is
+     * charged through `addOrderBatchCall` instead of `addOrderCall`. Everything
+     * else about this method — the bounded re-ask loop, the 'queue' profiling —
+     * is deliberately shared: a batch call waits for its budget exactly the way
+     * a single call does.
+     */
+    batch?: { type: 'add' | 'cancel'; engineCost: number },
   ): Promise<TimeProfile | undefined> {
     const isOrderMethod = ['submitOrder', 'cancelOrder', 'amendOrder'].includes(
       method,
     )
-    const isHeavyMethod = ['getLedgersInfo', 'getTradesHistory'].includes(
-      method,
-    )
+    // Kraken bills its history endpoints at 2, not 1. `getClosedOrders` is one
+    // of them and was absent from this list AND — until now — was reached on a
+    // path that never called this function at all (see `getOrder`'s
+    // closed-orders fallback), so the busiest Kraken read on the platform was
+    // charged nothing while the venue charged double.
+    const isHeavyMethod = [
+      'getLedgersInfo',
+      'getTradesHistory',
+      'getClosedOrders',
+    ].includes(method)
 
     if (timeProfile) {
       timeProfile = this.startProfilerTime(timeProfile, 'queue')
@@ -815,21 +948,50 @@ class KrakenExchange extends AbstractExchange implements Exchange {
     // the legacy global counter is used.
     const accountKey = hashKrakenKey(this.key)
 
-    let waitTime = 0
-    if (isOrderMethod && symbol) {
-      const orderType =
-        method === 'submitOrder'
-          ? 'add'
-          : method === 'cancelOrder'
-            ? 'cancel'
-            : 'amend'
-      waitTime = await limitHelper.addOrderCall(symbol, orderType, accountKey)
-    } else {
-      waitTime = await limitHelper.addRestCall(isHeavyMethod, accountKey)
+    const charge = async () => {
+      if (batch && symbol) {
+        return await limitHelper.addOrderBatchCall(
+          symbol,
+          batch.type,
+          batch.engineCost,
+          accountKey,
+        )
+      }
+      if (isOrderMethod && symbol) {
+        const orderType =
+          method === 'submitOrder'
+            ? 'add'
+            : method === 'cancelOrder'
+              ? 'cancel'
+              : 'amend'
+        return await limitHelper.addOrderCall(symbol, orderType, accountKey)
+      }
+      return await limitHelper.addRestCall(isHeavyMethod, accountKey)
     }
 
-    if (waitTime > 0) {
+    // Re-ask after waiting, and keep asking until the budget actually admits
+    // the call. The limiter does NOT charge a refused call (by design — a
+    // parked request is not a sent one), so the previous single
+    // `sleep(waitTime)` sent the request having taken no token at all: under
+    // load, when every call is being deferred, the local counter stopped
+    // counting almost everything while Kraken kept counting all of it. The
+    // model was least accurate exactly where it is load-bearing, and it drifted
+    // in the direction that produces `EAPI:Rate limit exceeded` with local
+    // headroom to spare.
+    //
+    // Bounded, because this now blocks rather than passes through: the
+    // per-account REST bucket refills at 0.33-0.5/s so a legitimate wait is
+    // seconds, and anything beyond the ceiling means the account is saturated
+    // by something this call cannot outwait. Giving up returns control to the
+    // caller's own retry/backoff rather than holding a connector slot open.
+    let waitTime = await charge()
+    for (
+      let attempt = 0;
+      waitTime > 0 && attempt < KRAKEN_LIMIT_WAIT_ATTEMPTS;
+      attempt++
+    ) {
       await sleep(waitTime)
+      waitTime = await charge()
     }
 
     if (timeProfile) {
@@ -1122,8 +1284,14 @@ class KrakenExchange extends AbstractExchange implements Exchange {
     side: string
     updateTime?: number
     transactTime?: number
+    /** Raw `fee` from Kraken's order payload — the fee it actually charged. */
+    fee?: string
+    /** Raw `oflags`, which names the currency the fee came out of. */
+    oflags?: string
   }): CommonOrder {
+    const fee = krakenOrderFee(order.fee, order.oflags, order.side)
     return {
+      ...fee,
       symbol: order.symbol,
       orderId: order.orderId,
       clientOrderId: order.clientOrderId || '',
@@ -1580,8 +1748,11 @@ class KrakenExchange extends AbstractExchange implements Exchange {
       timeProfile
     timeProfile = this.startProfilerTime(timeProfile, 'exchange')
 
+    // BalanceEx, not Balance: the basic endpoint reports only the total, so
+    // funds held by open orders were returned as `free` with `locked: 0`.
+    // Same "Query funds" permission and rate cost as Balance.
     return this.spotClient
-      .getAccountBalance()
+      .getExtendedBalance()
       .then(async (result) => {
         timeProfile = this.endProfilerTime(timeProfile, 'exchange')
 
@@ -1590,11 +1761,10 @@ class KrakenExchange extends AbstractExchange implements Exchange {
         }
 
         const balances: FreeAsset = []
-        for (const [asset, balance] of Object.entries(result.result)) {
+        for (const [asset, b] of Object.entries(result.result)) {
           balances.push({
             asset: this.symbolMapper.getActualAssetName(asset),
-            free: parseFloat(balance as string),
-            locked: 0, // Kraken's basic balance doesn't separate locked
+            ...krakenSpotFreeLocked(b),
           })
         }
 
@@ -1746,6 +1916,7 @@ class KrakenExchange extends AbstractExchange implements Exchange {
         limitPrice: type === 'LIMIT' ? price : undefined,
         cliOrdId: newClientOrderId,
         reduceOnly,
+        ...this.brokerParams(),
       }
 
       return this.derivativesClient
@@ -1763,6 +1934,11 @@ class KrakenExchange extends AbstractExchange implements Exchange {
                 'Failed to create order, no order events returned',
             )
           }
+          this.logBrokerTagged('futures', krakenSymbol, [
+            (result.sendStatus as { order_id?: string }).order_id ||
+              newClientOrderId ||
+              '',
+          ])
           // Kraken states what this order actually executed at, right here, in
           // the submit response — and this used to be thrown away in favour of
           // a re-fetch whose only price source is `getOrderStatus` (limit price
@@ -1820,10 +1996,14 @@ class KrakenExchange extends AbstractExchange implements Exchange {
         pair: await this.toKrakenSymbol(symbol),
         volume: quantity.toString(),
         price: type === 'LIMIT' ? price.toString() : undefined,
-        userref: newClientOrderId
-          ? parseInt(newClientOrderId.substring(0, 8), 16)
+        // `cl_ord_id` and `userref` are MUTUALLY EXCLUSIVE on AddOrder — a
+        // request carrying both is rejected — so this replaces the userref,
+        // it does not accompany it.
+        cl_ord_id: newClientOrderId
+          ? this.krakenClOrdId(newClientOrderId)
           : undefined,
         ...this.xstockParams(symbol),
+        ...this.brokerParams(),
       })
       .then(async (result) => {
         timeProfile = this.endProfilerTime(timeProfile, 'exchange')
@@ -1833,26 +2013,22 @@ class KrakenExchange extends AbstractExchange implements Exchange {
         }
 
         const orderIds = result.result.txid || []
+        this.logBrokerTagged('spot', symbol, orderIds)
 
         await sleep(500)
-        // Re-fetch by the Kraken txid via QueryOrders — the ONLY unambiguous
-        // lookup available. getOrder() resolves spot orders by userref =
-        // parseInt(clientOrderId.substring(0,8), 16); every Gainium client id
-        // starts with a shared prefix ("D-…", "GRID-…"), so parseInt stops at
-        // the first non-hex char and MANY orders collide on the same userref
-        // (e.g. all "D-*" ids → 13). With ≥2 such orders on the account,
-        // getOrder() returned a DIFFERENT order's data — an instantly-filled
-        // market Add came back as the account's resting limit order (open/
-        // vol_exec 0), so the fill was silently never registered on the deal
-        // (community thread 4890). QueryOrders also covers the closed-orders
-        // consistency lag for instantly-filled market orders.
+        // Re-fetch by the Kraken txid via QueryOrders. This stays the primary
+        // read even now that the order carries a cl_ord_id: QueryOrders is the
+        // one lookup that is authoritative for open AND closed orders in a
+        // single call, so it also covers the closed-orders consistency lag for
+        // an instantly-filled market order — which the open-orders scan cannot,
+        // and which silently lost fills on the deal (community thread 4890).
         const txid = orderIds?.[0]
         if (txid) {
           // QueryOrders can briefly lag right after submit, so a single miss
           // does not mean the order failed — we hold its txid and the submit
-          // succeeded. Retry the exact lookup a few times before ever touching
-          // the userref path, which collides (all client ids → one userref) and
-          // would report a just-placed order as "not found" (false negative).
+          // succeeded. Retry the exact lookup a few times before falling back
+          // to a list scan, which would report a just-placed order as "not
+          // found" (false negative) if it has not surfaced yet.
           for (let attempt = 0; attempt < 3; attempt++) {
             const fetched = await this.getSpotOrderByTxid(
               txid,
@@ -1867,8 +2043,8 @@ class KrakenExchange extends AbstractExchange implements Exchange {
           }
         }
         // Last resort: prefer the Kraken txid so getOrder() re-routes through
-        // the exact isKrakenSpotTxid() path; only fall back to the ambiguous
-        // client-order-id/userref lookup when no txid was returned at all.
+        // the exact isKrakenSpotTxid() path; only fall back to the client-order-id
+        // lookup when no txid was returned at all.
         return await this.getOrder(
           { symbol, newClientOrderId: txid || newClientOrderId || '' },
           timeProfile,
@@ -1895,6 +2071,768 @@ class KrakenExchange extends AbstractExchange implements Exchange {
   }
 
   /**
+   * Is this id already legal as Kraken's FREE-TEXT `cl_ord_id`?
+   *
+   * "Free format ascii text up to 18 characters". main-app now generates Kraken
+   * spot client order ids inside that budget
+   * (`main-app core/src/bot/main.ts` `getOrderId`, spec 010), e.g.
+   * `GRID-STAB-zT5628` — so from those callers the id needs no encoding at all
+   * and the id on the Gainium order row IS the id Kraken holds.
+   *
+   * This is the discriminator between the new form and the ~35-character legacy
+   * one, and it is a property of the id itself, so nothing has to be stored and
+   * the two populations can coexist indefinitely. Callers check
+   * {@link KrakenExchange#isKrakenSpotTxid} first, so a txid never reaches here.
+   */
+  private isKrakenFreeTextClOrdId(id: string): boolean {
+    return (
+      id.length > 0 &&
+      id.length <= KRAKEN_FREE_TEXT_CL_ORD_ID_MAX &&
+      // ASCII printable, which is all "free format ascii text" can be. Gainium
+      // ids are `[A-Za-z0-9-]`; the guard is here for anything else a caller
+      // hands us, so a byte Kraken would reject is encoded instead of sent.
+      /^[\x20-\x7e]+$/.test(id)
+    )
+  }
+
+  /**
+   * A Gainium client order id as Kraken's native `cl_ord_id`.
+   *
+   * Kraken accepts exactly three forms: a long UUID (8-4-4-4-12 hex), a SHORT
+   * UUID (32 hex, no dashes), or free ASCII text of at most 18 characters.
+   *
+   * - **New ids pass through verbatim.** main-app generates Kraken spot ids
+   *   inside the 18-character free-text budget, so the id is sent as-is. That is
+   *   the whole point of the pair of changes: the DB id and the venue id are one
+   *   string, so an order can be addressed at Kraken — by us, by an operator, by
+   *   any future caller — without re-deriving anything.
+   * - **Legacy ids are encoded.** A pre-spec-010 id is ~35 mixed-case
+   *   alphanumerics (`D-RO-o54rqRLIW9rTGgeSaVaepKlstZBZpY`) and is none of the
+   *   three forms, so it becomes sha256 of the WHOLE id, first 32 hex chars —
+   *   the short-UUID form. Deterministic, so submitOrder, getOrder and
+   *   cancelOrder all recompute the same value with nothing stored; 128 bits, so
+   *   two client ids do not collide.
+   *
+   * Truncating a legacy id to 18 characters instead is deliberately NOT done:
+   * `D-RO-` plus 13 characters is not unique across a bot's orders, and a
+   * non-injective encoding is the entire defect this replaces
+   * (`userref = parseInt(id.substring(0,8), 16)` collapsed every `D-*` id to 13,
+   * every `CMB-*` to 12 and every `GRID-*` to NaN). See
+   * `specs/003.kraken-spot-native-cl-ord-id.md`.
+   */
+  private krakenClOrdId(clientOrderId: string): string {
+    if (this.isKrakenFreeTextClOrdId(clientOrderId)) {
+      return clientOrderId
+    }
+    return this.krakenShortUuidClOrdId(clientOrderId)
+  }
+
+  /** The short-UUID encoding itself, so its one other caller cannot drift. */
+  private krakenShortUuidClOrdId(clientOrderId: string): string {
+    return createHash('sha256').update(clientOrderId).digest('hex').slice(0, 32)
+  }
+
+  /**
+   * Every `cl_ord_id` an order placed under THIS client id could be carrying,
+   * most likely first.
+   *
+   * One value for a legacy id (the sha32 encoding). Two for a new free-text id:
+   * the id itself, and its sha32 encoding — because main-app and the connector
+   * deploy separately, and an order submitted by the new main-app while the old
+   * connector was still running was hashed on the way out. Without the second
+   * candidate that order becomes unresolvable the moment this code goes live,
+   * `getOrder` answers "Order not found in history", and main-app reads that as
+   * a venue denial and retires a live order as a phantom. One extra ClosedOrders
+   * call on a miss is the price; the open-orders scan is unfiltered, so there it
+   * costs nothing.
+   */
+  private krakenClOrdIdCandidates(clientOrderId: string): string[] {
+    if (!clientOrderId) {
+      return []
+    }
+    if (!this.isKrakenFreeTextClOrdId(clientOrderId)) {
+      return [this.krakenClOrdId(clientOrderId)]
+    }
+    return [clientOrderId, this.krakenShortUuidClOrdId(clientOrderId)]
+  }
+
+  /**
+   * The answer when the LEGACY userref lookup matched more than one Kraken spot
+   * order. Orders placed since `krakenClOrdId` carry a native `cl_ord_id` and
+   * are resolved exactly; these are the ones placed before it, which carry only
+   * `userref = parseInt(id.substring(0,8), 16)` and nothing to disambiguate
+   * with. For them the only honest answers remain "exactly one match, here it
+   * is" and this. Reachable until those orders drain off live accounts.
+   *
+   * `returnBad`, not `throw`, on purpose. A throw in the open-orders scan is
+   * caught below and re-asked as a closed-orders lookup, which collides in
+   * exactly the same way, and `handleKrakenErrors` would then spend its retry
+   * ladder re-deriving a verdict that is deterministic.
+   *
+   * The wording is load-bearing and is asserted by
+   * `ambiguous-userref.spec.ts`: it must match none of main-app's
+   * `unknownOrderMessages` (`core/src/bot/main.ts:200`) and must not satisfy
+   * `isDefinitiveOrderNotFound` (`:403`) — say "not found" here and
+   * `cancelOrderOnExchange` routes the refusal to `_handleUnknownOrder`, which
+   * retires a live order as a phantom. An ambiguity is "the call did not
+   * succeed", never "the venue says this order does not exist".
+   */
+  private ambiguousUserrefMatch(
+    clientOrderId: string,
+    userref: number | undefined,
+    count: number,
+    list: 'open' | 'closed',
+    timeProfile: TimeProfile,
+  ): BaseReturn<CommonOrder> {
+    return this.returnBad(timeProfile)(
+      new Error(
+        `Ambiguous order lookup: client order id ${clientOrderId} maps to ` +
+          `Kraken userref ${userref}, which matches ${count} ${list} orders. ` +
+          `Kraken spot cannot resolve a client order id; refusing to guess. ` +
+          `Address this order by its txid.`,
+      ),
+    )
+  }
+
+  /**
+   * One QueryOrders row -> `CommonOrder`. Shared by the single-txid lookup and
+   * the batch below so the two can never drift: they read the same endpoint and
+   * must produce the same order.
+   */
+  private async convertSpotQueryOrder(
+    txid: string,
+    orderData: {
+      descr?: {
+        pair?: string
+        price?: string
+        ordertype?: string
+        type?: string
+      }
+      fee?: string
+      oflags?: string
+      price?: string
+      vol?: string
+      vol_exec?: string
+      status?: string
+    },
+    symbol: string,
+    clientOrderId: string,
+  ): Promise<CommonOrder> {
+    return this.convertOrder({
+      orderId: txid,
+      symbol: await this.normalizeSymbol(orderData.descr?.pair || symbol),
+      clientOrderId,
+      fee: orderData.fee,
+      oflags: orderData.oflags,
+      // `price` is the average executed price — the real fill price for
+      // market orders, whose descr.price is '0'. Fall back to the limit
+      // price for unfilled orders.
+      price:
+        +(orderData.price || 0) > 0
+          ? orderData.price
+          : orderData.descr?.price || '0',
+      origQty: orderData.vol || '0',
+      executedQty: orderData.vol_exec || '0',
+      status: orderData.status || 'NEW',
+      type: orderData.descr?.ordertype || 'limit',
+      side: orderData.descr?.type?.toUpperCase() || 'BUY',
+    })
+  }
+
+  /**
+   * Resolve up to 50 spot orders per venue call via QueryOrders, which is
+   * authoritative for open AND closed orders and costs the same one REST token
+   * whether it carries one txid or fifty.
+   *
+   * This exists because the reconcile pass is a strictly serial
+   * `for (…) await getOrder(o)` and Kraken's private REST budget is tiny — 20
+   * tokens decaying at 0.5/s per account. Average Kraken load measured over 6h
+   * on 2026-08-31 was 2.5 calls/min, ~8% of that budget, but the sweep arrives
+   * in bursts: 11 bursts carried 735 of 913 calls, the largest 119 calls in
+   * 51s. Each burst drains the bucket in seconds, after which every further
+   * call — including the user's `openOrder` — is parked for the ~2.1s the
+   * refusal formula returns. 50.5% of ALL Kraken order placements were queued,
+   * 72% of `openOrder` specifically, while Kraken itself never once rate-limited
+   * us (zero `EAPI:Rate limit exceeded` fleet-wide over two days). The burst is
+   * the whole problem, and one call per 50 orders removes it.
+   *
+   * Only txids are batched. QueryOrders resolves by txid; the userref path is
+   * the ambiguous one (`parseInt(id.slice(0,8),16)`, on which every Gainium id
+   * collides — see `getOrder`), and batching an ambiguous lookup would multiply
+   * that ambiguity rather than resolve it. Anything not batched here is simply
+   * absent from the result and the caller falls back to its per-order path,
+   * which is what resolves it today.
+   */
+  override async getOrdersBatch({
+    symbol,
+    newClientOrderIds,
+  }: {
+    symbol: string
+    newClientOrderIds: string[]
+  }): Promise<BaseReturn<CommonOrder[]>> {
+    let timeProfile = this.getEmptyTimeProfile()
+    // Kraken Futures has its own multi-id lookup (`getOrderStatus` already
+    // takes `cliOrdIds: string[]`), but its not-found path falls through to
+    // `getOrderEvents` per order, which is a different shape. Left on the
+    // per-order path deliberately rather than half-batched.
+    if (this.usdm || !this.spotClient) {
+      return super.getOrdersBatch({ symbol, newClientOrderIds })
+    }
+    const txids = [...new Set(newClientOrderIds)].filter((id) =>
+      this.isKrakenSpotTxid(id),
+    )
+    if (!txids.length) {
+      return super.getOrdersBatch({ symbol, newClientOrderIds })
+    }
+
+    const orders: CommonOrder[] = []
+    for (let i = 0; i < txids.length; i += KRAKEN_QUERY_ORDERS_MAX) {
+      const chunk = txids.slice(i, i + KRAKEN_QUERY_ORDERS_MAX)
+      timeProfile =
+        (await this.checkLimits('getOrders', symbol, timeProfile)) ||
+        timeProfile
+      timeProfile = this.startProfilerTime(timeProfile, 'exchange')
+      const result = await this.spotClient.getOrders({ txid: chunk.join(',') })
+      timeProfile = this.endProfilerTime(timeProfile, 'exchange')
+      if (!result.result || result.error?.length) {
+        // A partial batch is still useful: the caller resolves whatever came
+        // back and falls back per-order for the rest. Only a batch that
+        // resolved NOTHING is reported as a failure.
+        break
+      }
+      for (const txid of chunk) {
+        const orderData = result.result[txid]
+        if (!orderData) {
+          continue
+        }
+        orders.push(
+          await this.convertSpotQueryOrder(txid, orderData, symbol, txid),
+        )
+      }
+    }
+
+    if (!orders.length) {
+      return super.getOrdersBatch({ symbol, newClientOrderIds })
+    }
+    return this.returnGood<CommonOrder[]>(timeProfile)(orders)
+  }
+
+  /**
+   * ONE QueryOrders call for up to {@link KRAKEN_QUERY_ORDERS_MAX} txids, for
+   * the bulk paths. Returns the rows Kraken answered with, or `null` when the
+   * CALL did not succeed.
+   *
+   * The `null` is the point: a caller must be able to tell "the venue answered
+   * and has no such order" from "we could not ask". Collapsing the two would
+   * make a nonce collision or an outage look like a venue denial, which is how
+   * a live order gets retired — the same distinction
+   * {@link querySpotOrderByTxid} exists to keep for the single-id lookup.
+   *
+   * Charged through `checkLimits` like every other read (one REST token,
+   * whatever the chunk size), and `timeProfile` is the caller's own object,
+   * which this mutates in place the way every other call site does.
+   */
+  private async querySpotOrdersChunk(
+    txids: string[],
+    symbol: string,
+    timeProfile: TimeProfile,
+  ): Promise<Record<string, KrakenSpotOrderRow> | null> {
+    if (!this.spotClient || !txids.length) {
+      return null
+    }
+    try {
+      timeProfile =
+        (await this.checkLimits('getOrders', symbol, timeProfile)) ||
+        timeProfile
+      timeProfile = this.startProfilerTime(timeProfile, 'exchange')
+      const result = await this.spotClient.getOrders({ txid: txids.join(',') })
+      timeProfile = this.endProfilerTime(timeProfile, 'exchange')
+      if (!result.result || result.error?.length) {
+        return null
+      }
+      return result.result as Record<string, KrakenSpotOrderRow>
+    } catch (error) {
+      this.endProfilerTime(timeProfile, 'exchange')
+      // Message only — NEVER the error object. @siebly/kraken-api's
+      // `parseException` staples the live API-Key / API-Sign headers onto what
+      // it throws (see `querySpotOrderByTxid`), so logging it raw puts
+      // credentials in a pm2 line.
+      Logger.warn(
+        `Kraken spot batch order lookup failed for ${txids.length} orders on ${symbol}: ${this.krakenErrorMessage(error)}`,
+      )
+      this.noteKrakenRateLimit(error)
+      return null
+    }
+  }
+
+  /**
+   * What the venue or the transport actually said, and nothing else.
+   *
+   * Never returns or logs the thrown object: for a spot HTTP failure that
+   * object carries the request's live `API-Key` / `API-Sign` headers (see the
+   * note on `querySpotOrderByTxid`). Kraken's own error array is preferred when
+   * there is one, because that is the text main-app classifies on — a timeout
+   * or a reset is ambiguous (the orders may have been placed), a validation
+   * rejection is definitive.
+   */
+  private krakenErrorMessage(error: unknown): string {
+    if (typeof error === 'string') {
+      return error
+    }
+    const e = error as {
+      body?: { error?: string[] }
+      message?: string
+      code?: string | number
+    }
+    const fromBody = Array.isArray(e?.body?.error)
+      ? e.body.error.join(', ')
+      : ''
+    return (
+      fromBody ||
+      e?.message ||
+      (e?.code ? `Kraken request failed with status ${e.code}` : '') ||
+      'Kraken request failed'
+    )
+  }
+
+  /**
+   * Tell the limiter about a real Kraken rate-limit rejection, the way
+   * `handleKrakenErrors` does — the bulk paths do not run through it (they must
+   * never re-drive a send), so they have to note this themselves or an account
+   * whose true budget is tighter than assumed never gets its tier downgrade.
+   *
+   * Only the per-ACCOUNT spellings. Kraken's public limit is per egress IP and
+   * says nothing about any account's private budget.
+   */
+  private noteKrakenRateLimit(error: unknown) {
+    const message = this.krakenErrorMessage(error)
+    if (
+      message.includes('EAPI:Rate limit exceeded') ||
+      message.includes('apiLimitExceeded')
+    ) {
+      limitHelper.noteRateLimited(hashKrakenKey(this.key))
+    }
+  }
+
+  /**
+   * Cancel up to {@link KRAKEN_CANCEL_BATCH_MAX} spot orders per venue call via
+   * `CancelOrderBatch`, and report the ones this call OBSERVED as cancelled.
+   *
+   * The single-order path costs two private-REST tokens per order (resolve the
+   * txid, then cancel) against a per-key bucket of 20 refilling at 0.5/s, so
+   * closing a deal with tens of resting orders is paced by the bucket and not
+   * by the venue. One read plus one cancel for a whole chunk removes that.
+   *
+   * What it will NOT do is claim more than it saw. Kraken's bulk cancel answers
+   * `{count}` and nothing else, so:
+   *
+   * - orders the pre-read shows as already terminal are left out entirely —
+   *   they are not even sent, and the fill/cancel race they represent stays
+   *   with the per-order path that owns it (unknown-order ladder included);
+   * - when `count` matches what was sent, every id sent is reported cancelled,
+   *   described by the row read moments earlier — the same "report the real
+   *   order, never synthesised zeros" rule as `spotCancelByTxid` (spec 013);
+   * - when it does not match, or the call's outcome is unknown, the chunk is
+   *   re-read and ONLY rows the venue now calls `canceled` are reported, from
+   *   that fresh read, so a partial fill carries its real executed quantity.
+   *
+   * Anything absent from the answer means "I did not cancel this / cannot vouch
+   * for it", and the caller cancels it one by one exactly as it does today.
+   */
+  override async cancelOrdersBatch({
+    symbol,
+    newClientOrderIds,
+  }: {
+    symbol: string
+    newClientOrderIds: string[]
+  }): Promise<BaseReturn<CommonOrder[]>> {
+    const timeProfile = this.getEmptyTimeProfile()
+    // Kraken FUTURES has `batchOrder`, but it is a different contract (send +
+    // cancel + edit in one envelope, with its own per-element status shape) and
+    // the futures cancel path already reports a real outcome. Left on the
+    // per-order path deliberately rather than half-batched.
+    if (this.usdm || !this.spotClient) {
+      return super.cancelOrdersBatch({ symbol, newClientOrderIds })
+    }
+    // Only txids. Kraken's bulk cancel also accepts `cl_ord_ids`, but a
+    // Gainium client order id resolves ambiguously on this venue (see
+    // `getOrder`), and a bulk call is the worst place to resolve an ambiguity —
+    // it would cancel somebody else's order with no way to notice. Anything not
+    // a txid is simply absent from the answer and the caller resolves it the
+    // way it does today.
+    const txids = [...new Set(newClientOrderIds)].filter((id) =>
+      this.isKrakenSpotTxid(id),
+    )
+    // One order is not a batch: it costs the same two REST calls as the
+    // per-order path and skips its unknown-order handling.
+    if (txids.length < 2) {
+      return this.nothingCancelledInBatch(timeProfile)
+    }
+
+    const cancelled: CommonOrder[] = []
+    for (let i = 0; i < txids.length; i += KRAKEN_CANCEL_BATCH_MAX) {
+      const chunk = txids.slice(i, i + KRAKEN_CANCEL_BATCH_MAX)
+
+      // (a) One read for the chunk. This is both the `lastSeen` each reported
+      // order is described by and the filter for what is worth sending.
+      const rows = await this.querySpotOrdersChunk(chunk, symbol, timeProfile)
+      if (!rows) {
+        continue
+      }
+      const live = chunk.filter((txid) =>
+        KRAKEN_CANCELLABLE_STATUSES.has(rows[txid]?.status ?? ''),
+      )
+      // (b) Same rule as above, now that we know what is actually open.
+      if (live.length < 2) {
+        continue
+      }
+
+      // (c) What Kraken's matching engine will charge for these exact cancels:
+      // its penalty is scaled by how long each order has rested, and the read
+      // above carries `opentm` for every one of them. A missing `opentm` is
+      // charged the worst case rather than assumed cheap.
+      const now = Date.now()
+      const engineCost = live.reduce((sum, txid) => {
+        const opentm = rows[txid]?.opentm
+        const ageSeconds =
+          opentm === undefined ? NaN : (now - opentm * 1000) / 1000
+        return sum + krakenCancelCostForAge(ageSeconds)
+      }, 0)
+
+      const outcome = await this.cancelSpotBatchChunk(
+        live,
+        symbol,
+        engineCost,
+        timeProfile,
+      )
+
+      // (e) The venue cancelled exactly what it was handed. Report each one as
+      // the order we read, with the one thing actually observed — CANCELED.
+      // Never promoted to FILLED even when the row carries fills: that is the
+      // engine's decision (spec 013 §3).
+      if (outcome === live.length) {
+        for (const txid of live) {
+          cancelled.push({
+            ...(await this.convertSpotQueryOrder(
+              txid,
+              rows[txid],
+              symbol,
+              // The txid as the client order id, exactly like `getOrdersBatch`:
+              // the caller keys on `orderId`, and inventing a client id here
+              // would be asserting something we did not read.
+              txid,
+            )),
+            orderId: txid,
+            status: 'CANCELED',
+          })
+        }
+        continue
+      }
+
+      // (f) Anything else — a count that disagrees, or a call whose outcome we
+      // do not know — is decided by the venue, not by us. Re-read the chunk and
+      // report only what it now calls `canceled`, converted from that FRESH row
+      // so a fill that landed in the race carries its real executed quantity.
+      // If the re-read cannot answer either, this chunk contributes nothing and
+      // the caller cancels it per order. One bad chunk never throws: the chunks
+      // already resolved are still an answer.
+      const after = await this.querySpotOrdersChunk(live, symbol, timeProfile)
+      if (!after) {
+        continue
+      }
+      for (const txid of live) {
+        const row = after[txid]
+        if (row?.status !== 'canceled') {
+          continue
+        }
+        cancelled.push({
+          ...(await this.convertSpotQueryOrder(txid, row, symbol, txid)),
+          orderId: txid,
+          status: 'CANCELED',
+        })
+      }
+    }
+
+    // Nothing observed is not an answer, and the caller loops as it does
+    // today.
+    if (!cancelled.length) {
+      return this.nothingCancelledInBatch(timeProfile)
+    }
+    return this.returnGood<CommonOrder[]>(timeProfile)(cancelled)
+  }
+
+  /**
+   * "This venue batches, and this batch cancelled nothing" — deliberately NOT
+   * worded as the base class's "not supported".
+   *
+   * The two mean different things to a caller that remembers the answer. "Not
+   * supported" is a fact about the venue, true for the life of the process, and
+   * a caller is right to stop asking. "Nothing cancelled" is a fact about THESE
+   * orders — they had all filled already, or only one was still resting — and
+   * happens routinely. Saying the first when the second is meant would switch
+   * bulk cancel off for the venue the first time a batch arrived too late.
+   */
+  private nothingCancelledInBatch(
+    timeProfile: TimeProfile,
+  ): BaseReturn<CommonOrder[]> {
+    return {
+      status: StatusEnum.notok as StatusEnum.notok,
+      data: null,
+      reason: 'Batch cancel confirmed no orders',
+      usage: limitHelper.getUsage(),
+      timeProfile,
+    }
+  }
+
+  /**
+   * Send ONE `CancelOrderBatch` and report how many the venue says it
+   * cancelled, or `undefined` when the outcome is unknown (the call errored or
+   * threw). Never throws, and deliberately does NOT go through
+   * `handleKrakenErrors`: that re-invokes the method it wraps, which here is
+   * the whole bulk method — a resend, not a retry.
+   */
+  private async cancelSpotBatchChunk(
+    txids: string[],
+    symbol: string,
+    engineCost: number,
+    timeProfile: TimeProfile,
+  ): Promise<number | undefined> {
+    try {
+      timeProfile =
+        (await this.checkLimits('cancelOrder', symbol, timeProfile, {
+          type: 'cancel',
+          engineCost,
+        })) || timeProfile
+      timeProfile = this.startProfilerTime(timeProfile, 'exchange')
+      const result = await this.spotClient!.cancelBatchOrders({ orders: txids })
+      timeProfile = this.endProfilerTime(timeProfile, 'exchange')
+      if (!result.result || result.error?.length) {
+        throw new Error(result.error?.join(', ') || 'Failed to cancel orders')
+      }
+      return result.result.count
+    } catch (error) {
+      this.endProfilerTime(timeProfile, 'exchange')
+      // Message only — the thrown object carries live credentials.
+      Logger.warn(
+        `Kraken spot batch cancel of ${txids.length} orders on ${symbol} did not confirm: ${this.krakenErrorMessage(error)}`,
+      )
+      this.noteKrakenRateLimit(error)
+      return undefined
+    }
+  }
+
+  /**
+   * Place 2..{@link KRAKEN_ADD_BATCH_MAX} spot LIMIT orders in ONE
+   * `AddOrderBatch` call, all on one pair, and answer every one of them.
+   *
+   * Same arithmetic as the cancel above, from the other side: the per-order
+   * path spends two REST tokens per order (place, then re-read) against a
+   * 20-token bucket refilling at 0.5/s, so building a grid is paced by the
+   * bucket. One send plus one re-read for the whole batch removes that.
+   *
+   * Two properties this must never lose:
+   *
+   * - **The send is never retried.** Kraken validates the whole batch before
+   *   submitting any of it, so a validation rejection placed nothing — but a
+   *   TIMEOUT may have placed everything, and resending is then a duplicate
+   *   batch. A whole-batch failure is returned as `notok` with the venue's own
+   *   words, which is what lets the caller classify it.
+   * - **A placed order is never reported absent.** If the post-send read lags,
+   *   the order is built from what was SENT plus the txid the venue issued —
+   *   see the comment at that branch.
+   */
+  override async openOrdersBatch({
+    symbol,
+    orders,
+  }: {
+    symbol: string
+    orders: BatchOpenOrder[]
+  }): Promise<BaseReturn<BatchOpenResult[]>> {
+    let timeProfile = this.getEmptyTimeProfile()
+    if (this.usdm || !this.spotClient) {
+      return super.openOrdersBatch({ symbol, orders })
+    }
+    // Kraken's own bounds, checked here so a batch it would reject wholesale is
+    // never sent: it takes 2..15 orders on ONE pair, and validates all of them
+    // before submitting any.
+    if (
+      orders.length < KRAKEN_ADD_BATCH_MIN ||
+      orders.length > KRAKEN_ADD_BATCH_MAX
+    ) {
+      return super.openOrdersBatch({ symbol, orders })
+    }
+    // Everything the answer's shape depends on. A MARKET order has no place in
+    // a batch whose per-item reply is `{txid}` and whose re-read may lag — it
+    // fills immediately and the caller needs its price — and an order without a
+    // client order id cannot be matched back to the request at all. A decline
+    // sends nothing, so the caller places these the way it does today.
+    const usable = orders.every(
+      (order) =>
+        (order.type ?? 'LIMIT') === 'LIMIT' &&
+        !!order.newClientOrderId &&
+        Number.isFinite(order.quantity) &&
+        order.quantity > 0 &&
+        Number.isFinite(order.price) &&
+        order.price > 0,
+    )
+    if (!usable) {
+      return super.openOrdersBatch({ symbol, orders })
+    }
+
+    timeProfile =
+      (await this.checkLimits('submitOrder', symbol, timeProfile, {
+        type: 'add',
+        engineCost: orders.length,
+      })) || timeProfile
+
+    let replies: { txid?: string; error?: string }[]
+    try {
+      timeProfile = this.startProfilerTime(timeProfile, 'exchange')
+      const result = await this.spotClient.submitBatchOrders({
+        pair: await this.toKrakenSymbol(symbol),
+        // Field for field what the single spot `openOrder` sends, including
+        // `cl_ord_id` (which replaces `userref` — the two are mutually
+        // exclusive on AddOrder and on its batch form alike).
+        orders: orders.map((order) => ({
+          ordertype: 'limit' as const,
+          type: order.side.toLowerCase() as 'buy' | 'sell',
+          volume: order.quantity.toString(),
+          price: order.price.toString(),
+          cl_ord_id: this.krakenClOrdId(order.newClientOrderId),
+        })),
+        ...this.xstockParams(symbol),
+        ...this.brokerParams(),
+      })
+      timeProfile = this.endProfilerTime(timeProfile, 'exchange')
+      if (!result.result || result.error?.length) {
+        throw new Error(result.error?.join(', ') || 'Failed to create orders')
+      }
+      replies = result.result.orders ?? []
+      this.logBrokerTagged(
+        'spotBatch',
+        symbol,
+        replies.map((r) => r.txid ?? ''),
+      )
+    } catch (error) {
+      timeProfile = this.endProfilerTime(timeProfile, 'exchange')
+      this.noteKrakenRateLimit(error)
+      // NO retry, and no `handleKrakenErrors`: it re-invokes the method it
+      // wraps, which here would re-send the whole batch. Kraken's own text is
+      // passed through unchanged — main-app classifies on it, and a timeout it
+      // cannot recognise is read as "nothing was placed" about a batch that may
+      // be live.
+      //
+      // The one thing added is for a failure Kraken did NOT word. A refusal
+      // arrives as Kraken's error array and is definitive: nothing was placed.
+      // Anything else — a dropped socket, a bare `Request failed with status
+      // code 502` — is silence about a request that may have landed, and those
+      // shapes are worded by the HTTP stack, not by us, so the caller's
+      // classifier cannot be relied on to know them all. Up to fifteen live
+      // orders ride on that reading, so it is said outright, in words the
+      // classifier is known to match.
+      const message = this.krakenErrorMessage(error)
+      const venueWorded = /\bE[A-Za-z]+:/.test(message)
+      const outcomeUnknown =
+        !venueWorded || /EGeneral:Internal error/i.test(message)
+      return this.returnBad(timeProfile)(
+        new KrakenError(
+          outcomeUnknown
+            ? `Server error, batch outcome unknown: ${message}`
+            : message,
+          String((error as { code?: string | number })?.code ?? ''),
+        ),
+      )
+    }
+
+    // The venue answers positionally, so the id the CALLER gave us is what each
+    // answer is keyed by — alignment alone is never the only thing holding the
+    // request and the reply together.
+    const placed = orders
+      .map((order, index) => ({ order, reply: replies[index] }))
+      .filter((entry) => !!entry.reply?.txid)
+
+    // QueryOrders can lag right behind a submit, exactly as it does on the
+    // single path, so the read is retried a few times for whatever is still
+    // missing. Each read is one REST token for every txid still outstanding.
+    const rows: Record<string, KrakenSpotOrderRow> = {}
+    let missing = placed.map((p) => p.reply!.txid!)
+    if (missing.length) {
+      await sleep(500)
+      for (let attempt = 0; attempt < 3 && missing.length; attempt++) {
+        if (attempt > 0) {
+          await sleep(500)
+        }
+        const answered = await this.querySpotOrdersChunk(
+          missing,
+          symbol,
+          timeProfile,
+        )
+        if (answered) {
+          for (const txid of missing) {
+            if (answered[txid]) {
+              rows[txid] = answered[txid]
+            }
+          }
+        }
+        missing = missing.filter((txid) => !rows[txid])
+      }
+    }
+
+    const results: BatchOpenResult[] = []
+    for (let index = 0; index < orders.length; index++) {
+      const order = orders[index]
+      const reply = replies[index]
+      const txid = reply?.txid
+
+      if (!txid) {
+        results.push({
+          newClientOrderId: order.newClientOrderId,
+          // Kraken's per-item `error` is this order's own definitive refusal,
+          // passed through in its own words. An item carrying neither a txid
+          // nor an error describes nothing at all, and saying so is the only
+          // honest answer — the caller must not read silence as "placed".
+          reason: reply?.error || 'No result for this order in the batch reply',
+        })
+        continue
+      }
+
+      const row = rows[txid]
+      results.push({
+        newClientOrderId: order.newClientOrderId,
+        order: row
+          ? await this.convertSpotQueryOrder(
+              txid,
+              row,
+              symbol,
+              order.newClientOrderId,
+            )
+          : // The re-read still has not caught up. This is NOT an invented
+            // order: Kraken issued this txid for this request, so the order is
+            // live, and what it was placed as is what we sent. Reporting it
+            // absent would make the caller place it again — a duplicate live
+            // order, the one outcome worth more than a stale field. Built the
+            // way `getOrder`'s open-orders scan builds one, with nothing
+            // executed asserted and the reconcile pass to correct it.
+            this.convertOrder({
+              orderId: txid,
+              // Our symbol, not `normalizeSymbol(symbol)`: this order was not
+              // read back from Kraken, so there is no Kraken pair name to map.
+              symbol,
+              clientOrderId: order.newClientOrderId,
+              price: order.price.toString(),
+              origQty: order.quantity.toString(),
+              executedQty: '0',
+              status: 'NEW',
+              type: 'limit',
+              side: order.side,
+            }),
+      })
+    }
+
+    return this.returnGood<BatchOpenResult[]>(timeProfile)(results)
+  }
+
+  /**
    * Kraken requires `asset_class: 'tokenized_asset'` on every public/private
    * per-pair call for tokenized-equity ("xStocks") pairs — without it Kraken
    * replies "Unknown asset pair". Returns the param object to spread into the
@@ -1912,10 +2850,112 @@ class KrakenExchange extends AbstractExchange implements Exchange {
   }
 
   /**
+   * API Partner tag for order placement (spot `AddOrder` / `AddOrderBatch`,
+   * futures `sendorder`). Omitted when the caller sent no valid code, so an
+   * order is never refused over attribution.
+   */
+  private brokerParams(): { broker?: string } {
+    return this.broker ? { broker: this.broker } : {}
+  }
+
+  /**
+   * One line per order Kraken accepted with `broker` set — the evidence that
+   * a given txid / order_id was submitted under the API Partner ID.
+   */
+  private logBrokerTagged(
+    path: 'spot' | 'spotBatch' | 'futures',
+    symbol: string,
+    orderIds: string[],
+  ) {
+    if (!this.broker) {
+      return
+    }
+    Logger.log(
+      `Kraken broker | ${path} | ${symbol} | ${orderIds.filter(Boolean).join(',')} | ${this.broker}`,
+    )
+  }
+
+  /**
+   * What an exact QueryOrders lookup said about a txid. Three answers, kept
+   * apart because a caller must act differently on each:
+   *
+   *   - `found`   — the venue has the order, open or closed.
+   *   - `unknown` — the venue ANSWERED and does not know the txid. The only
+   *                 answer an order may ever be retired on.
+   *   - `failed`  — the call did not succeed (nonce, rate limit, outage,
+   *                 transport). Says nothing about the order. `thrown` tells
+   *                 a rejected request (whose error object comes from the SDK
+   *                 and carries live credentials — never log it raw) from an
+   *                 error array delivered in a 200 body.
+   *
+   * The distinction is the whole point. Collapsing `unknown` and `failed`
+   * into one "could not resolve" is how a transient miss on a FILLED order
+   * gets reported to the caller as the venue denying it.
+   */
+  private async querySpotOrderByTxid(
+    txid: string,
+    symbol: string,
+    clientOrderId: string,
+    timeProfile: TimeProfile,
+  ): Promise<
+    | { kind: 'found'; order: BaseReturn<CommonOrder> }
+    | { kind: 'unknown'; reason: string }
+    | { kind: 'failed'; error: Error; thrown: boolean }
+  > {
+    try {
+      timeProfile =
+        (await this.checkLimits('getOrders', symbol, timeProfile)) ||
+        timeProfile
+      timeProfile = this.startProfilerTime(timeProfile, 'exchange')
+      const result = await this.spotClient!.getOrders({ txid })
+      timeProfile = this.endProfilerTime(timeProfile, 'exchange')
+      if (result.error?.length) {
+        const reason = result.error.join(', ')
+        // Kraken's own spelling of "no such order". Anything else in the
+        // error array is about the CALL — a nonce, a rate limit, an outage.
+        return /EOrder:(Unknown|Invalid) order/.test(reason)
+          ? { kind: 'unknown', reason }
+          : { kind: 'failed', error: new Error(reason), thrown: false }
+      }
+      if (!result.result) {
+        return {
+          kind: 'failed',
+          error: new Error('Failed to get orders'),
+          thrown: false,
+        }
+      }
+      const orderData = result.result[txid]
+      if (!orderData) {
+        return {
+          kind: 'unknown',
+          reason: `QueryOrders has no record of txid ${txid}`,
+        }
+      }
+      return {
+        kind: 'found',
+        order: this.returnGood<CommonOrder>(timeProfile)(
+          await this.convertSpotQueryOrder(
+            txid,
+            orderData,
+            symbol,
+            clientOrderId,
+          ),
+        ),
+      }
+    } catch (error) {
+      this.endProfilerTime(timeProfile, 'exchange')
+      return { kind: 'failed', error: error as Error, thrown: true }
+    }
+  }
+
+  /**
    * Resolve a spot order by its Kraken txid via QueryOrders. Exact —
    * immune to the shared-userref collision in getOrder() — and works
-   * regardless of open/closed state. Returns null when the txid can't
-   * be resolved (caller falls back to the legacy userref lookup).
+   * regardless of open/closed state. Returns null when the txid can't be
+   * resolved right now, for the ONE caller that may legitimately wait and ask
+   * again: `openOrder`, which holds a txid the venue issued seconds ago and
+   * knows QueryOrders can lag behind it. `getOrder` must not use this — it
+   * has to know WHY, and asks {@link querySpotOrderByTxid} directly.
    */
   private async getSpotOrderByTxid(
     txid: string,
@@ -1926,44 +2966,33 @@ class KrakenExchange extends AbstractExchange implements Exchange {
     if (!this.spotClient) {
       return null
     }
-    try {
-      timeProfile =
-        (await this.checkLimits('getOrders', symbol, timeProfile)) ||
-        timeProfile
-      timeProfile = this.startProfilerTime(timeProfile, 'exchange')
-      const result = await this.spotClient.getOrders({ txid })
-      timeProfile = this.endProfilerTime(timeProfile, 'exchange')
-      if (!result.result || result.error?.length) {
-        return null
-      }
-      const orderData = result.result[txid]
-      if (!orderData) {
-        return null
-      }
-      return this.returnGood<CommonOrder>(timeProfile)(
-        this.convertOrder({
-          orderId: txid,
-          symbol: await this.normalizeSymbol(orderData.descr?.pair || symbol),
-          clientOrderId,
-          // `price` is the average executed price — the real fill price for
-          // market orders, whose descr.price is '0'. Fall back to the limit
-          // price for unfilled orders.
-          price:
-            +(orderData.price || 0) > 0
-              ? orderData.price
-              : orderData.descr?.price || '0',
-          origQty: orderData.vol || '0',
-          executedQty: orderData.vol_exec || '0',
-          status: orderData.status || 'NEW',
-          type: orderData.descr?.ordertype || 'limit',
-          side: orderData.descr?.type?.toUpperCase() || 'BUY',
-        }),
-      )
-    } catch {
-      // Any failure here is non-fatal — caller falls back to getOrder().
-      timeProfile = this.endProfilerTime(timeProfile, 'exchange')
-      return null
+    const lookup = await this.querySpotOrderByTxid(
+      txid,
+      symbol,
+      clientOrderId,
+      timeProfile,
+    )
+    if (lookup.kind === 'found') {
+      return lookup.order
     }
+    if (lookup.kind === 'failed' && lookup.thrown) {
+      // A lockout or rate-limit rejection is NOT "this txid is unresolvable".
+      // Returning null here sends the caller down the userref path, which
+      // issues a SECOND request to the very account Kraken has just told us to
+      // stop calling — doubling the load at the only moment it must not, and
+      // extending the lockout that caused it (#543). Rethrow so the caller's
+      // own error handling backs off instead of retrying through this path.
+      const msg = `${lookup.error?.message ?? ''} ${safeStringify(lookup.error)}`
+      if (
+        msg.includes('EGeneral:Temporary lockout') ||
+        msg.includes('EAPI:Rate limit exceeded') ||
+        msg.includes('EGeneral:Too many requests')
+      ) {
+        throw lookup.error
+      }
+    }
+    // Anything else really is non-fatal — caller falls back to getOrder().
+    return null
   }
 
   async getOrder(
@@ -2189,23 +3218,47 @@ class KrakenExchange extends AbstractExchange implements Exchange {
     // every Gainium id shares a prefix. This is what repairs missed-fill
     // reconcile for resting Kraken spot orders (forum #4890).
     if (this.isKrakenSpotTxid(newClientOrderId)) {
-      const byTxid = await this.getSpotOrderByTxid(
+      const lookup = await this.querySpotOrderByTxid(
         newClientOrderId,
         symbol,
         newClientOrderId,
         timeProfile,
       )
-      if (byTxid) {
-        return byTxid
+      if (lookup.kind === 'found') {
+        return lookup.order
       }
+      // Never fall through to the userref scan for a txid. `parseInt('O…', 16)`
+      // is NaN, so that scan cannot find the order and always ends in "Order
+      // not found in open orders" — a definitive-looking negative manufactured
+      // from a lookup that may merely have failed, about the one list a FILLED
+      // order is guaranteed to be absent from. A caller that trusted the
+      // wording retired three filled safety orders as phantoms on a restart,
+      // and nothing was logged here because the failure had been swallowed.
+      // Report what QueryOrders actually said instead: a venue denial is
+      // worded so main-app's `isDefinitiveOrderNotFound` matches it; a failed
+      // call keeps its real reason, so it is logged with it, retried here when
+      // it is on the retry list (a nonce collision is), and read as ambiguous
+      // by the caller when it is not.
+      return this.handleKrakenErrors(
+        this.getOrder,
+        { symbol, newClientOrderId },
+        timeProfile,
+      )(
+        lookup.kind === 'unknown'
+          ? new Error(`Order not found: ${lookup.reason}`)
+          : lookup.error,
+      )
     }
 
     timeProfile =
       (await this.checkLimits('getOrders', symbol, timeProfile)) || timeProfile
     timeProfile = this.startProfilerTime(timeProfile, 'exchange')
 
-    // Kraken doesn't support querying by client order ID directly for spot
-    // We need to use userref if it was set, or fetch all open orders
+    // Asked UNFILTERED on purpose, even though OpenOrders accepts a
+    // `cl_ord_id` filter: the legacy userref pass below has to read the same
+    // payload, and a filter Kraken did not honour would hand us every open
+    // order with nothing to tell them apart — which is the defect this whole
+    // path is about. One call, then match locally.
     return this.spotClient
       .getOpenOrders()
       .then(async (result) => {
@@ -2215,31 +3268,78 @@ class KrakenExchange extends AbstractExchange implements Exchange {
           throw new Error(result.error?.[0] || 'Failed to get orders')
         }
 
-        // Find order by client order ID (userref)
-        // Convert client order ID to userref (same way as in submitOrder)
-        const userref = newClientOrderId
+        const orders = result.result.open || {}
+        const clOrdIds = this.krakenClOrdIdCandidates(newClientOrderId)
+
+        // The exact answer: Kraken carries our own client order id back on
+        // every row, so identity is read, not inferred.
+        const exact = clOrdIds.length
+          ? Object.entries(orders).filter(
+              ([, orderData]) =>
+                !!orderData.cl_ord_id && clOrdIds.includes(orderData.cl_ord_id),
+            )
+          : []
+
+        // LEGACY ONLY, and only for a LEGACY-SHAPED id. Orders placed before the
+        // cl_ord_id switch carry a `userref = parseInt(id.substring(0,8), 16)`
+        // and nothing else, and stay resting on live accounts until they drain —
+        // so they must still be findable, or main-app reads "not found" and
+        // retires a live order as a phantom. That userref is NOT evidence of
+        // identity: parseInt stops at the first non-hex char, so every `D-*` id
+        // collapses to 13 and every `CMB-*` to 12. Hence the same rule as before
+        // — one candidate is an answer, several are a refusal
+        // (`ambiguousUserrefMatch`). A row that carries some OTHER cl_ord_id is
+        // definitively not the order asked about and is excluded, so a new order
+        // can never be reached this way.
+        //
+        // A free-text id is never asked this question. It can only exist on an
+        // order placed after spec 010, which therefore carries a cl_ord_id and is
+        // resolved above or not at all — and its own derived userref collides in
+        // exactly the same way (`D-RO-xxxxxx` also reads as 13), so running the
+        // scan for it could only ever return somebody else's order.
+        const legacyShaped =
+          !!newClientOrderId && !this.isKrakenFreeTextClOrdId(newClientOrderId)
+        const userref = legacyShaped
           ? parseInt(newClientOrderId.substring(0, 8), 16)
           : undefined
-
-        const orders = result.result.open || {}
-        for (const [orderId, orderData] of Object.entries(orders)) {
-          if (orderData.userref?.toString() === userref?.toString()) {
-            return this.returnGood<CommonOrder>(timeProfile)(
-              this.convertOrder({
-                orderId,
-                symbol: await this.normalizeSymbol(
-                  orderData.descr?.pair || symbol,
-                ),
-                clientOrderId: newClientOrderId,
-                price: orderData.descr?.price || '0',
-                origQty: orderData.vol || '0',
-                executedQty: orderData.vol_exec || '0',
-                status: orderData.status || 'NEW',
-                type: orderData.descr?.ordertype || 'limit',
-                side: orderData.descr?.type?.toUpperCase() || 'BUY',
-              }),
-            )
-          }
+        const matches = exact.length
+          ? exact
+          : legacyShaped
+            ? Object.entries(orders).filter(
+                ([, orderData]) =>
+                  !orderData.cl_ord_id &&
+                  orderData.userref?.toString() === userref?.toString(),
+              )
+            : []
+        if (matches.length > 1) {
+          return this.ambiguousUserrefMatch(
+            newClientOrderId,
+            userref,
+            matches.length,
+            'open',
+            timeProfile,
+          )
+        }
+        const found = matches[0]
+        if (found) {
+          const [orderId, orderData] = found
+          return this.returnGood<CommonOrder>(timeProfile)(
+            this.convertOrder({
+              orderId,
+              symbol: await this.normalizeSymbol(
+                orderData.descr?.pair || symbol,
+              ),
+              clientOrderId: newClientOrderId,
+              fee: orderData.fee,
+              oflags: orderData.oflags,
+              price: orderData.descr?.price || '0',
+              origQty: orderData.vol || '0',
+              executedQty: orderData.vol_exec || '0',
+              status: orderData.status || 'NEW',
+              type: orderData.descr?.ordertype || 'limit',
+              side: orderData.descr?.type?.toUpperCase() || 'BUY',
+            }),
+          )
         }
 
         throw new Error('Order not found in open orders')
@@ -2248,50 +3348,116 @@ class KrakenExchange extends AbstractExchange implements Exchange {
         // If order not found in open orders, try closed orders history
         if (error.message?.includes('Order not found')) {
           try {
+            // Charged like every other venue call. This was the one Kraken
+            // read that skipped the limiter entirely, and it is reached on the
+            // hottest path there is — the reconcile fallback for an order that
+            // is no longer open, i.e. every fill.
+            timeProfile =
+              (await this.checkLimits(
+                'getClosedOrders',
+                symbol,
+                timeProfile,
+              )) || timeProfile
             timeProfile = this.startProfilerTime(timeProfile, 'exchange')
 
-            // Convert client order ID to userref (same way as in submitOrder)
-            const userref = newClientOrderId
+            const clOrdIds = this.krakenClOrdIdCandidates(newClientOrderId)
+            // Legacy-shaped ids only — see the open-orders scan for why a
+            // free-text id must never be resolved through a derived userref.
+            const legacyShaped =
+              !!newClientOrderId &&
+              !this.isKrakenFreeTextClOrdId(newClientOrderId)
+            const userref = legacyShaped
               ? parseInt(newClientOrderId.substring(0, 8), 16)
               : undefined
 
-            const closedResult = await this.spotClient!.getClosedOrders({
-              userref,
-            })
-
-            timeProfile = this.endProfilerTime(timeProfile, 'exchange')
-
-            if (!closedResult.result || closedResult.error?.length) {
-              throw new Error(
-                closedResult.error?.[0] || 'Failed to get closed orders',
-              )
+            // Filtered server-side, unlike the open-orders scan: ClosedOrders
+            // is paginated (50 rows a page), so an unfiltered read would simply
+            // miss an order that has since been buried by newer ones.
+            const fetchClosed = async (params: {
+              cl_ord_id?: string
+              userref?: number
+            }) => {
+              const res = await this.spotClient!.getClosedOrders(params)
+              if (!res.result || res.error?.length) {
+                throw new Error(res.error?.[0] || 'Failed to get closed orders')
+              }
+              return Object.entries(res.result.closed || {})
             }
 
-            // Find order by client order ID (userref) in closed orders
-            const closedOrders = closedResult.result.closed || {}
-            for (const [orderId, orderData] of Object.entries(closedOrders)) {
-              if (orderData.userref?.toString() === userref?.toString()) {
-                return this.returnGood<CommonOrder>(timeProfile)(
-                  this.convertOrder({
-                    orderId,
-                    symbol: await this.normalizeSymbol(
-                      orderData.descr?.pair || symbol,
-                    ),
-                    clientOrderId: newClientOrderId,
-                    // avg executed price when filled (descr.price is '0'
-                    // for market orders), limit price otherwise
-                    price:
-                      +(orderData.price || 0) > 0
-                        ? orderData.price
-                        : orderData.descr?.price || '0',
-                    origQty: orderData.vol || '0',
-                    executedQty: orderData.vol_exec || '0',
-                    status: orderData.status || 'FILLED',
-                    type: orderData.descr?.ordertype || 'limit',
-                    side: orderData.descr?.type?.toUpperCase() || 'BUY',
-                  }),
-                )
+            // The exact answer first. The re-check on the row's own cl_ord_id
+            // is not redundant with the filter: a Kraken deployment that
+            // ignored an unrecognised parameter would return every closed
+            // order, and trusting the filter alone would resolve an arbitrary
+            // one — exactly the failure this change removes.
+            //
+            // A free-text id has a second candidate (its sha32 encoding, for an
+            // order submitted while the previous connector was still running —
+            // see `krakenClOrdIdCandidates`). ClosedOrders filters server-side
+            // and takes one `cl_ord_id`, so the candidates are asked in order and
+            // the second is paid for only when the first missed.
+            let exactClosed: Awaited<ReturnType<typeof fetchClosed>> = []
+            for (const candidate of clOrdIds) {
+              exactClosed = (
+                await fetchClosed({ cl_ord_id: candidate })
+              ).filter(([, orderData]) => orderData.cl_ord_id === candidate)
+              if (exactClosed.length) {
+                break
               }
+            }
+
+            // LEGACY ONLY, and one extra venue call — paid only when the exact
+            // lookup found nothing, and only until pre-cl_ord_id orders drain.
+            // Same rule as the open-orders scan: one candidate is an answer,
+            // several are a refusal, and a row carrying some other cl_ord_id is
+            // not a candidate at all. Skipped outright when the derived userref
+            // is NaN (every `GRID-*` id — parseInt('GRID-RO-', 16) has no hex
+            // digit to read): Kraken was sent `userref: null` for those, so the
+            // legacy filter has never matched one and the call is pure cost.
+            const closedMatches = exactClosed.length
+              ? exactClosed
+              : Number.isFinite(userref)
+                ? (await fetchClosed({ userref })).filter(
+                    ([, orderData]) =>
+                      !orderData.cl_ord_id &&
+                      orderData.userref?.toString() === userref?.toString(),
+                  )
+                : []
+
+            timeProfile = this.endProfilerTime(timeProfile, 'exchange')
+            if (closedMatches.length > 1) {
+              return this.ambiguousUserrefMatch(
+                newClientOrderId,
+                userref,
+                closedMatches.length,
+                'closed',
+                timeProfile,
+              )
+            }
+            const closedFound = closedMatches[0]
+            if (closedFound) {
+              const [orderId, orderData] = closedFound
+              return this.returnGood<CommonOrder>(timeProfile)(
+                this.convertOrder({
+                  orderId,
+                  symbol: await this.normalizeSymbol(
+                    orderData.descr?.pair || symbol,
+                  ),
+                  clientOrderId: newClientOrderId,
+                  fee: orderData.fee,
+                  oflags: orderData.oflags,
+                  // avg executed price when filled (descr.price is '0'
+                  // for market orders), limit price otherwise
+                  price:
+                    +(orderData.price || 0) > 0
+                      ? orderData.price
+                      : orderData.descr?.price || '0',
+                  origQty: orderData.vol || '0',
+                  executedQty: orderData.vol_exec || '0',
+                  status: orderData.status || 'FILLED',
+                  type: orderData.descr?.ordertype || 'limit',
+                  side: orderData.descr?.type?.toUpperCase() || 'BUY',
+                }),
+              )
             }
 
             throw new Error('Order not found in history')
@@ -2328,7 +3494,17 @@ class KrakenExchange extends AbstractExchange implements Exchange {
       return this.returnBad(timeProfile)(new Error('Client order ID required'))
     }
 
-    // First get the order to find its exchange ID
+    // Resolve first, then cancel by the venue txid — deliberately NOT a direct
+    // `cancelOrder({ cl_ord_id })`, which would save this round trip. The spot
+    // cancel's CommonOrder carries the txid in `orderId`, and main-app's
+    // `cancelOrderOnExchange` copies every field of that response onto the
+    // order row it holds (`core/src/bot/main.ts`), `orderId` included — that
+    // write is the exact mechanism that left 163 Kraken txids each claimed by
+    // two order rows. A cl_ord_id cancel returns only `{count}`, so it would
+    // have to invent the txid it reports back. `getOrder` is now exact
+    // (cl_ord_id, see krakenClOrdId), so the txid this resolves to is the right
+    // one; a legacy userref-only order still resolves through the fallback
+    // scan and is likewise cancelled by its real txid.
     const orderResult = await this.getOrder(
       { symbol, newClientOrderId },
       timeProfile,
@@ -2340,10 +3516,127 @@ class KrakenExchange extends AbstractExchange implements Exchange {
 
     const orderId = orderResult.data.orderId
 
+    if (!this.usdm) {
+      // The order we just read IS the order about to be cancelled, and Kraken
+      // spot's cancel reply cannot describe it (see `spotCancelByTxid`). Hand
+      // it down so the report is the real order rather than a synthesised one,
+      // at no extra cost — the alternative is a second private call on an
+      // account whose whole REST budget is 20 tokens at 0.5/s.
+      return this.spotCancelByTxid(
+        { symbol, orderId: orderId.toString() },
+        orderResult.data,
+        timeProfile,
+      )
+    }
+
     return this.cancelOrderByOrderIdAndSymbol(
       { symbol, orderId: orderId.toString() },
       timeProfile,
     )
+  }
+
+  /**
+   * Cancel a Kraken SPOT order by txid and report what was cancelled.
+   *
+   * Kraken spot's REST cancel answers `{count}` and nothing else, so the
+   * `CommonOrder` this has to return cannot come from the cancel reply. It used
+   * to be invented — `price: '0'`, `origQty: '0'`, `executedQty: '0'`,
+   * `type: 'LIMIT'`, `side: 'BUY'` — and main-app's `cancelOrderOnExchange`
+   * copies every field of the answer onto the order row it holds
+   * (`Object.keys(order)` loop, excluding only `clientOrderId`, `origQty` and
+   * `origPrice`). So a SELL limit resting at 565.72 was persisted as a BUY at 0,
+   * and a partial fill on a cancelled order as no fill at all — on a large share
+   * of Kraken spot cancels, including take profits on long spot deals, which
+   * cannot be BUYs at all. Spec `013`.
+   *
+   * `lastSeen` is the order as the caller read it moments ago. `cancelOrder`
+   * always has it (it resolves the txid through `getOrder` first); the
+   * by-orderId entry never does, and pays one QueryOrders token to re-read
+   * after the cancel.
+   *
+   * `status` is `CANCELED` regardless: a successful cancel is the only thing
+   * actually observed here. Whether a cancelled-with-fills order should be
+   * promoted to FILLED is the engine's decision — `setFilledInsteadOfCanceled`
+   * and the `promotePartialToFilled` opt-out — and reporting a re-read's
+   * `closed` as FILLED would additionally make main-app's terminal cancel fail
+   * with "Order was not canceled on exchange".
+   */
+  private async spotCancelByTxid(
+    order: {
+      symbol: string
+      orderId: string
+    },
+    lastSeen: CommonOrder | undefined,
+    timeProfile: TimeProfile,
+  ): Promise<BaseReturn<CommonOrder>> {
+    const { symbol, orderId } = order
+
+    if (!this.spotClient) {
+      return this.errorClient(timeProfile)
+    }
+
+    timeProfile =
+      (await this.checkLimits('cancelOrder', symbol, timeProfile)) ||
+      timeProfile
+    timeProfile = this.startProfilerTime(timeProfile, 'exchange')
+
+    return this.spotClient
+      .cancelOrder({
+        txid: orderId,
+      })
+      .then(async (result) => {
+        timeProfile = this.endProfilerTime(timeProfile, 'exchange')
+
+        if (!result.result || result.error?.length) {
+          throw new Error(result.error?.[0] || 'Failed to cancel order')
+        }
+
+        // Only asked when the caller had nothing: QueryOrders is exact and
+        // covers a closed order, so it reads the cancelled order back
+        // whichever way the cancel went.
+        const settled =
+          lastSeen ??
+          (await this.querySpotOrderByTxid(
+            orderId,
+            symbol,
+            '',
+            timeProfile,
+          ).then((lookup) =>
+            lookup.kind === 'found' ? lookup.order.data : undefined,
+          ))
+
+        if (!settled) {
+          // Nothing could be established — the venue denied the txid, or the
+          // re-read failed. The cancel still succeeded and must still be
+          // reported as one (a refusal sends `cancelOrderOnExchange` down its
+          // unknown-order ladder and retires a live order), so say what we
+          // know and OMIT what we do not: main-app copies a field only when
+          // the response HAS it, so an absent `price`/`executedQty`/`type`/
+          // `side` leaves the row's own value alone. Asserting `'0'` is what
+          // this whole method exists to stop doing. Spec `013` §4.3.
+          return this.returnGood<CommonOrder>(timeProfile)({
+            symbol,
+            orderId,
+            clientOrderId: '',
+            transactTime: Date.now(),
+            updateTime: Date.now(),
+            status: 'CANCELED',
+          } as unknown as CommonOrder)
+        }
+
+        return this.returnGood<CommonOrder>(timeProfile)({
+          ...settled,
+          orderId,
+          status: 'CANCELED',
+        })
+      })
+      .catch(
+        this.handleKrakenErrors(
+          this.cancelOrderByOrderIdAndSymbol,
+          order,
+          this.endProfilerTime(timeProfile, 'exchange'),
+        ),
+      )
   }
 
   async cancelOrderByOrderIdAndSymbol(
@@ -2426,47 +3719,10 @@ class KrakenExchange extends AbstractExchange implements Exchange {
         )
     }
 
-    if (!this.spotClient) {
-      return this.errorClient(timeProfile)
-    }
-
-    timeProfile =
-      (await this.checkLimits('cancelOrder', symbol, timeProfile)) ||
-      timeProfile
-    timeProfile = this.startProfilerTime(timeProfile, 'exchange')
-
-    return this.spotClient
-      .cancelOrder({
-        txid: orderId,
-      })
-      .then((result) => {
-        timeProfile = this.endProfilerTime(timeProfile, 'exchange')
-
-        if (!result.result || result.error?.length) {
-          throw new Error(result.error?.[0] || 'Failed to cancel order')
-        }
-
-        return this.returnGood<CommonOrder>(timeProfile)(
-          this.convertOrder({
-            orderId,
-            symbol,
-            clientOrderId: '',
-            price: '0',
-            origQty: '0',
-            executedQty: '0',
-            status: 'CANCELED',
-            type: 'LIMIT',
-            side: 'BUY',
-          }),
-        )
-      })
-      .catch(
-        this.handleKrakenErrors(
-          this.cancelOrderByOrderIdAndSymbol,
-          order,
-          this.endProfilerTime(timeProfile, 'exchange'),
-        ),
-      )
+    // Nothing was read before this cancel — this entry point is addressed by
+    // txid alone (main-app's terminal cancel) — so the helper re-reads the
+    // order afterwards instead of inventing it.
+    return this.spotCancelByTxid({ symbol, orderId }, undefined, timeProfile)
   }
 
   async getAllOpenOrders(
@@ -3149,7 +4405,7 @@ class KrakenExchange extends AbstractExchange implements Exchange {
         // — so `.message` is literally "OK" and the REAL reason ("EGeneral:
         // Permission denied", "EAPI:Invalid key", …) lives in `body.error`.
         // Logging `.message` made the first day of this fallback undiagnosable.
-        `Kraken trade volume lookup failed, falling back to the published fee ladder: ${
+        `Kraken trade volume lookup failed for account ${hashKrakenKey(this.key)}, falling back to the published fee ladder: ${
           (error as { body?: { error?: string[] } })?.body?.error?.join('; ') ||
           (error?.message && error.message !== 'OK'
             ? error.message
@@ -3176,15 +4432,53 @@ class KrakenExchange extends AbstractExchange implements Exchange {
    * refusing a chunk of 50 over one of them is the poisoning this avoids.
    */
   private async getAccountPairFees(
-    krakenPairs: string[],
+    pairInfos: Record<string, { fees?: number[][]; fees_maker?: number[][] }>,
   ): Promise<Map<string, { taker: number | null; maker: number | null }>> {
     const out = new Map<
       string,
       { taker: number | null; maker: number | null }
     >()
+    const krakenPairs = Object.keys(pairInfos)
     if (!this.spotClient || !this.key || !this.secret || !krakenPairs.length) {
       return out
     }
+
+    // Ask about ONE pair per published fee CLASS, not all ~1600.
+    //
+    // Kraken bills per schedule, not per pair: every pair sharing a published
+    // ladder bills an account the same way, which is why a real account's fees
+    // collapse to a handful of distinct (taker, maker) pairs — measured on
+    // production accounts: 3 to 5 groups covering all 1614 pairs, matching the
+    // published classes (standard crypto, the 0.20/0.20 class, the stablecoin
+    // class, and so on).
+    //
+    // Asking per pair cost 33 chunked calls per account. Kraken paces private
+    // REST per API KEY (counter ~15-20, decay ~0.5/s), so that is ~66s per
+    // account and ~59 MINUTES across 54 connections — longer than the hourly
+    // sweep's own period, so passes overlapped and accounts late in the
+    // iteration stopped being refreshed at all. It was invisible until the
+    // #543 lockout fix, because before that TradeVolume was failing FAST and
+    // never paying the pacing cost.
+    //
+    // One representative per class is 1-2 calls instead of 33, and the answer
+    // is the venue's own for every pair it is applied to — the grouping key is
+    // Kraken's published ladder, so two pairs share a representative only when
+    // Kraken itself puts them on the same schedule.
+    const classOf = (p: string) => {
+      const i = pairInfos[p]
+      return JSON.stringify([i?.fees ?? null, i?.fees_maker ?? null])
+    }
+    const representatives = new Map<string, string>()
+    const members = new Map<string, string[]>()
+    for (const p of krakenPairs) {
+      const k = classOf(p)
+      if (!representatives.has(k)) {
+        representatives.set(k, p)
+        members.set(k, [])
+      }
+      members.get(k)!.push(p)
+    }
+    const probePairs = [...representatives.values()]
 
     const cacheKey = `${hashKrakenKey(this.key)}:pairmap`
     const cached = krakenPairFeeMapCache.get(cacheKey)
@@ -3193,8 +4487,8 @@ class KrakenExchange extends AbstractExchange implements Exchange {
     }
 
     let failures = 0
-    for (let i = 0; i < krakenPairs.length; i += KRAKEN_TRADE_VOLUME_CHUNK) {
-      const chunk = krakenPairs.slice(i, i + KRAKEN_TRADE_VOLUME_CHUNK)
+    for (let i = 0; i < probePairs.length; i += KRAKEN_TRADE_VOLUME_CHUNK) {
+      const chunk = probePairs.slice(i, i + KRAKEN_TRADE_VOLUME_CHUNK)
       try {
         await this.checkLimits('getTradingVolume')
         const res = await this.spotClient.getTradingVolume({
@@ -3210,17 +4504,21 @@ class KrakenExchange extends AbstractExchange implements Exchange {
           const t = Number(takers[p]?.fee)
           const m = Number(makers[p]?.fee)
           if (Number.isFinite(t) || Number.isFinite(m)) {
-            out.set(p, {
+            const rate = {
               taker: Number.isFinite(t) ? t / 100 : null,
               maker: Number.isFinite(m) ? m / 100 : null,
-            })
+            }
+            // The answer is for this pair's whole published class.
+            for (const member of members.get(classOf(p)) ?? [p]) {
+              out.set(member, rate)
+            }
           }
         }
       } catch (error) {
         failures++
         if (failures === 1) {
           Logger.warn(
-            `Kraken pair-scoped trade volume failed (chunk ${i / KRAKEN_TRADE_VOLUME_CHUNK + 1}), affected pairs fall back to the ladder: ${
+            `Kraken pair-scoped trade volume failed for account ${hashKrakenKey(this.key)} (chunk ${i / KRAKEN_TRADE_VOLUME_CHUNK + 1}), affected pairs fall back to the ladder: ${
               (error as { body?: { error?: string[] } })?.body?.error?.join(
                 '; ',
               ) ||
@@ -3295,6 +4593,8 @@ class KrakenExchange extends AbstractExchange implements Exchange {
           taker: account.taker ?? krakenLadderFee(pairInfo.fees, null, 0.26),
           maker:
             account.maker ?? krakenLadderFee(pairInfo.fees_maker, null, 0.16),
+          // `venue` only when Kraken actually answered for this account.
+          source: account.taker != null ? 'venue' : 'ladder',
         }
 
         return this.returnGood<UserFee>(timeProfile)(fee)
@@ -3380,9 +4680,7 @@ class KrakenExchange extends AbstractExchange implements Exchange {
         // client-side ladder-by-volume interpolation: it duplicated arithmetic
         // Kraken already performs, and could only ever fire in the narrow case
         // where a chunk failed but a pairless call worked.
-        const pairFees = await this.getAccountPairFees(
-          Object.keys(result.result),
-        )
+        const pairFees = await this.getAccountPairFees(result.result)
 
         const fees: (UserFee & { pair: string })[] = Object.entries({
           ...result.result,
@@ -3393,6 +4691,8 @@ class KrakenExchange extends AbstractExchange implements Exchange {
             exact?.taker ?? krakenLadderFee(pairInfo.fees, null, 0.26)
           const makerFee =
             exact?.maker ?? krakenLadderFee(pairInfo.fees_maker, null, 0.16)
+          const source: UserFee['source'] =
+            exact?.taker != null ? 'venue' : 'ladder'
           const base = this.symbolMapper.getActualAssetName(pairInfo.base || '')
           const quote = this.symbolMapper.getActualAssetName(
             pairInfo.quote || '',
@@ -3401,6 +4701,7 @@ class KrakenExchange extends AbstractExchange implements Exchange {
             pair: `${base}-${quote}`,
             maker: makerFee,
             taker: takerFee,
+            source,
           }
         })
 
@@ -3424,8 +4725,6 @@ class KrakenExchange extends AbstractExchange implements Exchange {
     count?: number,
     timeProfile = this.getEmptyTimeProfile(),
   ): Promise<BaseReturn<CandleResponse[]>> {
-    const intervalMinutes = intervalMap[interval]
-
     if (this.usdm) {
       if (!this.derivativesClient) {
         return this.errorClient(timeProfile)
@@ -3484,6 +4783,37 @@ class KrakenExchange extends AbstractExchange implements Exchange {
       return this.errorClient(timeProfile)
     }
 
+    // `intervalMap` is a unit conversion, not a statement of what Kraken spot
+    // serves: it maps 3m/2h/8h to 3/120/480, none of which /0/public/OHLC
+    // accepts, so those three were rejected with `EGeneral:Invalid arguments`
+    // for every symbol and every window (bug #709). Kraken can still produce
+    // those bars — each is an exact multiple of a supported interval — so ask
+    // for the base it does serve and aggregate up.
+    const source = krakenSpotCandleSource(interval)
+    if (!source) {
+      // Unreachable with today's ExchangeIntervals, and deliberately so: a
+      // twelfth interval must fail here, once, rather than as a venue rejection
+      // repeated per window across every egress node. Returning before the
+      // request also keeps it out of `handleKrakenErrors`' retry ladder.
+      return this.returnBad(timeProfile)(
+        new KrakenError(
+          `Kraken spot does not support the ${interval} candle interval`,
+          '400',
+        ),
+      )
+    }
+
+    // Kraken always answers with the ~720 most recent candles — `since` cannot
+    // page backwards — so a window that ends before that horizon is guaranteed
+    // to filter down to nothing below. It used to cost one public
+    // (per-egress-IP) request per window, per node, per caller retry to learn
+    // that, which is the budget `EGeneral:Too many requests` is the exhaustion
+    // of. Answer it from here instead, with the same empty OK the request
+    // would have produced.
+    if (krakenSpotWindowIsUnreachable(to, source.baseMinutes, Date.now())) {
+      return this.returnGood<CandleResponse[]>(timeProfile)([])
+    }
+
     timeProfile =
       (await this.checkLimits('getCandles', symbol, timeProfile)) || timeProfile
     timeProfile = this.startProfilerTime(timeProfile, 'exchange')
@@ -3491,7 +4821,7 @@ class KrakenExchange extends AbstractExchange implements Exchange {
     return this.spotClient
       .getCandles({
         pair: await this.toKrakenSymbol(symbol),
-        interval: intervalMinutes as
+        interval: source.baseMinutes as
           1 | 5 | 15 | 30 | 60 | 240 | 1440 | 10080 | 21600,
         since: from ? Math.floor(from / 1000) : undefined,
         ...this.xstockParams(symbol),
@@ -3518,6 +4848,12 @@ class KrakenExchange extends AbstractExchange implements Exchange {
           close: candle[4],
           volume: candle[6],
         }))
+
+        // Roll the base interval up to the one that was asked for. No-op
+        // (bucketMs 0) for the eight intervals Kraken serves natively, so their
+        // response is byte-identical to before. Done BEFORE the range filter so
+        // a bar is built from every base candle Kraken returned for it.
+        candles = aggregateCandles(candles, source.bucketMs)
 
         // Filter by time range if specified
         if (from) {

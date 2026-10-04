@@ -7,6 +7,8 @@ import type {
 import Kucoin from '@gainium/kucoin-api'
 import AbstractExchange, { Exchange } from '../../abstractExchange'
 import limitHelper, { LimitType } from './limit'
+import { exhaustedKucoinReason, noteKucoinAttempt } from './errorOutcome'
+import { normalizeOrderFee, normalizeOrderFees } from '../../helpers/orderFee'
 import {
   BaseReturn,
   CandleResponse,
@@ -1337,6 +1339,8 @@ class KucoinExchange extends AbstractExchange implements Exchange {
       const tls =
         'Client network socket disconnected before secure TLS connection was established'.toLowerCase()
       const timeProfile: TimeProfile = args[args.length - 1]
+      // Spec 029: remember whether any attempt of this call could have landed.
+      noteKucoinAttempt(timeProfile, e)
       const ts =
         e.message.toLowerCase().indexOf('KC-API-TIMESTAMP'.toLowerCase()) !== -1
       // sleep 10 seconds if too many requests received
@@ -1435,8 +1439,12 @@ class KucoinExchange extends AbstractExchange implements Exchange {
           const newResult = await cb.bind(this)(...args)
           return newResult as T
         } else {
+          // Spec 029: the transport prefix only when some attempt was
+          // ambiguous — ten definitive refusals are a definitive refusal.
           return this.returnBad(timeProfile)(
-            new Error(`${this.exchangeProblems}${e.message} | ${e.code}`),
+            new Error(
+              exhaustedKucoinReason(timeProfile, e, this.exchangeProblems),
+            ),
           )
         }
       } else {
@@ -1503,7 +1511,22 @@ class KucoinExchange extends AbstractExchange implements Exchange {
               : `${+order.dealSize / +order.dealValue}`
             : order.price
         : order.price
+    // KuCoin settles the fee on the order record itself — `fee` with
+    // `feeCurrency` naming it — for both spot and futures. The currency is
+    // worth taking at face value rather than deriving from the pair: a KuCoin
+    // account with the KCS discount enabled pays in KCS, which is neither side
+    // of the traded pair, and futures settle in the margin coin.
+    //
+    // When fills were fetched they are the finer-grained truth (one fee line
+    // per trade, and a partially filled order can straddle two fee currencies),
+    // so prefer them and fall back to the order-level figure.
+    const fee = fills.length
+      ? normalizeOrderFees(
+          fills.map((f) => ({ amount: f.fee, asset: f.feeCurrency })),
+        )
+      : normalizeOrderFee(order.fee, order.feeCurrency)
     return {
+      ...fee,
       symbol: this.convertSymbol(order.symbol),
       orderId: order.id,
       clientOrderId: order.clientOid,

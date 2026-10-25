@@ -5,6 +5,108 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.27.21] - 2026-10-24
+
+### Fixed
+
+- Binance spot: the fills of an order that trades at placement now carry Binance's own trade id, so each fill can be matched to the exchange's trade history exactly. Binance sends a `tradeId` on every fill of the full placement response, but the client library's type omits it, so a made-up `<orderId>-<index>` was reported instead. That placeholder is still used when a fill arrives without a usable trade id (including the `-1` Binance reports for smart order routing allocations). Binance futures placements return no fills, so they are unchanged.
+
+## [1.27.20] - 2026-10-21
+
+### Fixed
+
+- Kraken spot: when a just-placed order could not be read back right away, the placement answer reported Kraken's order id as the client order id. It now carries the client order id that was sent.
+
+## [1.27.19] - 2026-10-19
+
+### Fixed
+
+- Bitget spot limit orders that have not filled yet are reported at their limit price. Bitget sends an average price of 0 until the order fills, and that 0 was reported as the order's price.
+
+## [1.27.18] - 2026-10-18
+
+### Fixed
+
+- KuCoin orders that closed with nothing executed are reported CANCELED. A market order KuCoin closes unexecuted (for example, for lack of funds) carries no `cancelExist` flag, so it was reported FILLED with an executed quantity of 0.
+
+## [1.27.17] - 2026-10-18
+
+### Fixed
+
+- Bitget stock token (Reality) orders refused while the token's trading session is closed now say the market is closed, instead of Bitget's bare "current operation is not supported". Bitget keeps these tokens listed and priced outside their trading hours, so the refusal was the only signal.
+
+## [1.27.16] - 2026-10-15
+
+### Added
+
+- Futures exchange info reports the delivery time of dated (non-perpetual) contracts on Bybit, Binance and KuCoin, read from each exchange's own instrument fields. Perpetuals report none.
+
+## [1.27.15] - 2026-10-15
+
+### Added
+
+- KuCoin futures exchange info reports each contract's maximum leverage, like Bybit, Bitget, Hyperliquid and OKX already do.
+
+## [1.27.14] - 2026-10-15
+### Fixed
+- Reverted 1.27.13. Bybit USDT/USDC perpetuals report a quote minimum of 0 again. Bybit accepts API orders on these contracts below its published minimum order value, so reporting that value made bots raise or refuse orders the exchange would have filled.
+
+## [1.27.13] - 2026-10-14
+### Fixed
+- Bybit USDT/USDC perpetuals and dated futures now report the exchange's minimum order value (`lotSizeFilter.minNotionalValue`) as the pair's quote minimum. It was reported as 0, so an order below the minimum was only caught when Bybit refused it. Inverse contracts keep 1, the contract size.
+
+## [1.27.12] - 2026-10-14
+### Fixed
+- Binance USDⓈ-M: a negative BNFCR wallet balance on a Multi-Assets (Credits mode) account is now reported in the futures balance as a negative `free`, as the user stream already reports it. The balance read used to write it as 0, so settled losses booked to BNFCR vanished from the stored balance after every refresh and the account's value left them out. Every other asset maps as before.
+
+## [1.27.11] - 2026-10-12
+### Security
+- Updated dependencies to patched versions.
+
+## [1.27.10] - 2026-10-12
+### Fixed
+- Binance USDⓈ-M: an account in Multi-Assets mode now reports its pooled available margin (the account-level `availableBalance`) through `/marginAvailableUsd`. Every collateral coin margins every contract in that mode, so a per-asset balance understated what the account could commit — for example an account holding only USDC, with no USDT, trading USDT-quoted perpetuals. Single-asset accounts, COIN-M and spot still report no pool.
+
+## [1.27.9] - 2026-10-09
+
+### Fixed
+
+- OKX: cancelling an order by its OKX order id retried a transient failure through the client-order-id cancel with no client order id, so the retry was refused ("Either client order ID or order ID is required") and the order stayed open. It now retries the same call.
+
+## [1.27.8] - 2026-10-09
+
+### Fixed
+
+- OKX: an order OKX has acknowledged is no longer reported as "Order does not exist" when OKX takes a few seconds to make it readable. The connector keeps reading it back, and a limit order that is still not readable is returned as resting (from OKX's own acknowledgement) instead of as a failure that left it live and untracked.
+
+## [1.27.7] - 2026-10-08
+
+### Changed
+
+- **KuCoin order reconciliation reads the active-orders list.** KuCoin has no lookup for several orders at once, so checking a bot's open orders against the exchange cost one request per order. The connector now answers the check from the account's active orders on the pair (50 per request, the same rate-limit weight as a single order lookup). Orders still active are resolved from that list, converted exactly as a single lookup converts them, and only orders that have since filled or been cancelled are looked up individually. Works for spot (by client order ID) and futures (by KuCoin order ID).
+
+## [1.27.6] - 2026-10-08
+
+### Fixed
+
+- **OKX requests queued behind other accounts' requests.** The connector rate-limited OKX private calls (orders, cancels, order lookups, balances, positions, account settings) in one bucket per method, shared by every OKX account on that connector, and smaller than what OKX allows a single account. A burst from one account parked everyone else's orders. Private calls are now limited per account, at OKX's published per-account rates split across the connector instances. A call that has to wait now waits only until the current window resets, not a whole new window. Public endpoints are unchanged.
+
+### Changed
+
+- **OKX order reconciliation reads the open-orders list.** When a bot checks its open orders against the exchange, OKX answered one order per request. The connector now answers the whole check from the account's open orders on the pair (100 per request): orders still open are resolved from that list, and only orders that have since filled or been cancelled are looked up individually.
+
+## [1.27.5] - 2026-10-07
+
+### Fixed
+
+- **OKX orders reported as refused while live on the exchange.** After OKX accepted an order, the connector read it back. If that read failed, or the answer to the submit was lost, the connector submitted the order again under the same client order ID. OKX answered "client order ID already exists", and the bot wrote off an order that was live on the exchange. A failed read-back now retries only the read. A failed submit asks OKX before submitting again, and an "already exists" answer for an order OKX has returns that order as placed. The order sent to OKX is unchanged.
+
+## [1.27.4] - 2026-10-07
+
+### Fixed
+
+- **Kraken Futures requests queued during busy moments.** Kraken Futures calls were throttled with the Kraken spot rate-limit model: a small bucket refilling at one call every two seconds, plus spot's per-pair order cost. Kraken Futures uses a different limit, a budget of 500 per 10 seconds per key with a published cost per endpoint (1 for an order-status read, 10 for placing or cancelling an order). Futures calls are now charged against that budget, public futures endpoints are not charged, and a Kraken Futures rate-limit rejection pauses the key for one window. Kraken spot limits are unchanged.
+
 ## [1.27.3] - 2026-10-03
 
 ### Fixed

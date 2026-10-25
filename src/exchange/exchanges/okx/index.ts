@@ -34,6 +34,7 @@ import {
   InstrumentType,
   RestClient as OKXRestClient,
   OrderDetails,
+  OrderListItem,
   OrderRequest,
   SetLeverageRequest,
   type APICredentials,
@@ -126,6 +127,10 @@ const candleMaxSize = 300
  */
 const XPERP_MISS_RETRY_MS = 5 * 60 * 1000
 
+/** `orders-pending` page size (OKX's maximum) and how many pages a reconcile batch reads. */
+const OKX_OPEN_ORDERS_PAGE = 100
+const OKX_OPEN_ORDERS_MAX_PAGES = 5
+
 /**
  * Backoff for OKX `50011 Too many requests`.
  *
@@ -151,6 +156,43 @@ const XPERP_MISS_RETRY_MS = 5 * 60 * 1000
  * typical recovery costs ~1-3s and four retries still fit inside the 30s
  * budget with room for the calls themselves.
  */
+/**
+ * OKX `51016`: an order under this clOrdId already exists. Matched on the
+ * sCode and, as a fallback, on the text OKX has used for it.
+ */
+const isDuplicateClOrdId = (e: {
+  code?: unknown
+  msg?: string
+  data?: { sCode?: string; sMsg?: string }[]
+}) => {
+  const first = e?.data?.[0]
+  if (`${first?.sCode ?? e?.code}` === '51016') return true
+  const text = `${first?.sMsg ?? e?.msg ?? ''}`.toLowerCase()
+  return (
+    text.includes('duplicated clordid') ||
+    text.includes('client order id already exists')
+  )
+}
+
+/**
+ * OKX `51603` ("Order does not exist") on a read-back of an order it has just
+ * acknowledged. That is OKX not having indexed the order yet, not a refusal.
+ */
+const isOrderNotVisibleYet = (e: {
+  code?: unknown
+  msg?: string
+  data?: { sCode?: string; sMsg?: string }[]
+}) => {
+  const first = e?.data?.[0]
+  if (`${first?.sCode ?? e?.code}` === '51603') return true
+  return `${first?.sMsg ?? e?.msg ?? ''}`
+    .toLowerCase()
+    .includes('order does not exist')
+}
+
+/** Waits between read-backs of an acknowledged order: ~6.5s in total. */
+const acceptedOrderReadBackDelaysMs = [0, 500, 1000, 2000, 3000]
+
 const tooManyRequestsBackoff = (attempts: number) => {
   const base = Math.min(1000 * 2 ** Math.max(0, attempts - 1), 8000)
   return Math.round(base * (0.5 + Math.random()))
@@ -243,11 +285,19 @@ class OKXExchange extends AbstractExchange implements Exchange {
   private static acctLvCache = new Map<string, { at: number; acctLv: string }>()
   private static readonly ACCT_LV_TTL = 10 * 60 * 1000
 
-  private async getAcctLv(): Promise<string | undefined> {
-    const cacheKey = createHash('sha256')
+  /**
+   * Digest of the credential plus the OKX origin (global and Europe are
+   * separate accounts) — identifies the account without holding its key.
+   */
+  private limitAccountRef(): string {
+    return createHash('sha256')
       .update(`${this.key ?? ''}|${this.okxSource ?? ''}`)
       .digest('hex')
       .slice(0, 16)
+  }
+
+  private async getAcctLv(): Promise<string | undefined> {
+    const cacheKey = this.limitAccountRef()
     const cached = OKXExchange.acctLvCache.get(cacheKey)
     if (cached && +new Date() - cached.at < OKXExchange.ACCT_LV_TTL) {
       return cached.acctLv
@@ -1005,7 +1055,7 @@ class OKXExchange extends AbstractExchange implements Exchange {
         }
         timeProfile = this.endProfilerTime(timeProfile, 'exchange')
         return this.handleOkxErrors(
-          this.cancelOrder,
+          this.cancelOrderByOrderIdAndSymbol,
           order,
           timeProfile,
         )(
@@ -1017,7 +1067,7 @@ class OKXExchange extends AbstractExchange implements Exchange {
       })
       .catch(
         this.handleOkxErrors(
-          this.cancelOrder,
+          this.cancelOrderByOrderIdAndSymbol,
           order,
           this.endProfilerTime(timeProfile, 'exchange'),
         ),
@@ -1403,6 +1453,79 @@ class OKXExchange extends AbstractExchange implements Exchange {
     )
   }
 
+  /**
+   * Resolve a reconcile pass's orders from the account's OPEN orders on the
+   * pair, a page of up to 100 per call, instead of one order-details call per
+   * order.
+   *
+   * OKX has no multi-id order lookup, so the reconcile pass asked for every
+   * open order of a bot one by one — one call per resting order, per pass.
+   *
+   * An order still on the open list is answered exactly as `getOrder` would
+   * (same row shape, same conversion). An order that is NOT on it has filled
+   * or been cancelled since, and is left out of the result: the caller then
+   * resolves it with its per-order lookup, which is the read that finds out
+   * which. So only the orders that changed cost a call of their own. The
+   * answer is good even when nothing matched — "none of these are open" is
+   * the venue's answer, not a failure to ask.
+   */
+  override async getOrdersBatch({
+    symbol,
+    newClientOrderIds,
+  }: {
+    symbol: string
+    newClientOrderIds: string[]
+  }): Promise<BaseReturn<CommonOrder[]>> {
+    let timeProfile = this.getEmptyTimeProfile()
+    const wanted = new Set(newClientOrderIds)
+    if (!symbol || !wanted.size) {
+      return super.getOrdersBatch({ symbol, newClientOrderIds })
+    }
+    await this.ensureXperpMap(false, symbol)
+    const instId = this.updateSymbol(symbol)
+    const orders: CommonOrder[] = []
+    let after: string | undefined
+    for (let page = 0; page < OKX_OPEN_ORDERS_MAX_PAGES; page++) {
+      timeProfile =
+        (await this.checkLimits('getOrderList', 3000, 25, timeProfile)) ||
+        timeProfile
+      timeProfile = this.startProfilerTime(timeProfile, 'exchange')
+      let rows: OrderListItem[]
+      try {
+        rows = await this.client.getOrderList({
+          instType: this.instTypeParam(),
+          instId,
+          limit: `${OKX_OPEN_ORDERS_PAGE}`,
+          ...(after ? { after } : {}),
+        })
+      } catch {
+        // Nothing read: decline, and the caller resolves every order itself.
+        // A later page failing still leaves the rows already found valid —
+        // an order absent from the answer is resolved per order, never
+        // taken as gone.
+        if (page === 0) {
+          return super.getOrdersBatch({ symbol, newClientOrderIds })
+        }
+        timeProfile = this.endProfilerTime(timeProfile, 'exchange')
+        break
+      }
+      timeProfile = this.endProfilerTime(timeProfile, 'exchange')
+      for (const o of rows ?? []) {
+        if (wanted.has(o.clOrdId)) {
+          orders.push(await this.convertOrder(o))
+        }
+      }
+      if (!rows?.length || rows.length < OKX_OPEN_ORDERS_PAGE) {
+        break
+      }
+      if (orders.length === wanted.size) {
+        break
+      }
+      after = rows[rows.length - 1].ordId
+    }
+    return this.returnGood<CommonOrder[]>(timeProfile)(orders)
+  }
+
   async getOrder(
     data: {
       symbol: string
@@ -1567,23 +1690,64 @@ class OKXExchange extends AbstractExchange implements Exchange {
       request.px = this.convertNumberToString(price)
     }
     timeProfile = this.startProfilerTime(timeProfile, 'exchange')
-    return this.orderClient
-      .submitOrder(request)
-      .then(async () => {
-        timeProfile =
-          (await this.checkLimits('getOrderDetails', 3000, 25, timeProfile)) ||
-          timeProfile
-        const search = {
-          clOrdId: order.newClientOrderId,
-          instId: symbol,
-        }
-        let orderData = await this.client.getOrderDetails(search)
-
-        if (!orderData.length) {
+    // The submit and the read-back are separate on purpose. Once OKX has
+    // accepted the order, submitting it again under the same clOrdId can only
+    // earn a 51016 ("already exists"), which the caller reads as a refusal and
+    // writes off an order that is live on the venue. So a failed read-back
+    // retries the READ (`getOrder`), and a failed submit asks OKX before it
+    // re-submits (`resubmitOrder`).
+    let submitAck: { ordId?: string; ts?: string } | undefined
+    const submitError = await this.orderClient.submitOrder(request).then(
+      (res: unknown) => {
+        submitAck = (Array.isArray(res) ? res[0] : undefined) as
+          { ordId?: string; ts?: string } | undefined
+        return undefined
+      },
+      (e) => e ?? new Error('OKX submit failed'),
+    )
+    if (submitError) {
+      timeProfile = this.endProfilerTime(timeProfile, 'exchange')
+      if (newClientOrderId && isDuplicateClOrdId(submitError)) {
+        const existing = await this.findOrderByClientId(
+          symbol,
+          newClientOrderId,
+          timeProfile,
+        )
+        if (existing) {
           Logger.warn(
-            `OKX Order data not found for ${order.newClientOrderId}. Sleep 1s`,
+            `OKX ${newClientOrderId} already exists on ${symbol}, returning the existing order`,
           )
-          await sleep(1000)
+          return existing
+        }
+      }
+      return this.handleOkxErrors(
+        this.resubmitOrder,
+        order,
+        timeProfile,
+      )(submitError)
+    }
+    try {
+      timeProfile =
+        (await this.checkLimits('getOrderDetails', 3000, 25, timeProfile)) ||
+        timeProfile
+      const search = {
+        clOrdId: order.newClientOrderId,
+        instId: symbol,
+      }
+      // OKX acknowledged the order, but can take seconds to serve it from the
+      // order-details endpoint, answering an empty list or `51603` "Order does
+      // not exist" meanwhile. Passing that answer on told the bot the order
+      // was refused while it rested live on the venue, untracked, holding the
+      // funds the bot's next attempt then lacked. So keep asking for a while.
+      let orderData: OrderDetails[] = []
+      for (const [i, delay] of acceptedOrderReadBackDelaysMs.entries()) {
+        if (delay) {
+          Logger.warn(
+            `OKX order ${order.newClientOrderId} not readable yet. Sleep ${delay}ms`,
+          )
+          await sleep(delay)
+        }
+        if (i) {
           timeProfile =
             (await this.checkLimits(
               'getOrderDetails',
@@ -1591,29 +1755,121 @@ class OKXExchange extends AbstractExchange implements Exchange {
               25,
               timeProfile,
             )) || timeProfile
+        }
+        try {
           orderData = await this.client.getOrderDetails(search)
-          timeProfile = this.endProfilerTime(timeProfile, 'exchange')
+        } catch (e) {
+          if (!isOrderNotVisibleYet(e as any)) throw e
+          orderData = []
         }
-        timeProfile = this.endProfilerTime(timeProfile, 'exchange')
-        if (orderData.length) {
-          return this.returnGood<CommonOrder>(timeProfile)(
-            await this.convertOrder(orderData[0]),
-          )
-        }
+        if (orderData.length) break
+      }
+      timeProfile = this.endProfilerTime(timeProfile, 'exchange')
+      if (orderData.length) {
+        return this.returnGood<CommonOrder>(timeProfile)(
+          await this.convertOrder(orderData[0]),
+        )
+      }
+      // Still not readable, but OKX's own submit answer carried an `ordId`:
+      // the order exists. Report it as resting; its fills arrive on the
+      // user stream. A market order has no price to report, so it is left
+      // to the bot's ambiguous-outcome check instead.
+      if (submitAck?.ordId && type === 'LIMIT') {
+        Logger.warn(
+          `OKX order ${order.newClientOrderId} acknowledged as ${submitAck.ordId} but not readable after ${acceptedOrderReadBackDelaysMs.length} attempts. Returning it as NEW`,
+        )
+        const ts = submitAck.ts || `${Date.now()}`
+        return this.returnGood<CommonOrder>(timeProfile)(
+          await this.convertOrder({
+            instId: symbol,
+            ordId: submitAck.ordId,
+            clOrdId: newClientOrderId,
+            px: request.px,
+            sz: request.sz,
+            side: request.side,
+            ordType: request.ordType,
+            posSide: request.posSide,
+            reduceOnly: request.reduceOnly,
+            state: 'live',
+            accFillSz: '0',
+            cTime: ts,
+            uTime: ts,
+          } as unknown as OrderDetails),
+        )
+      }
+      if (submitAck?.ordId) {
+        return this.returnBad(timeProfile)(
+          new Error(
+            `OKX order ${order.newClientOrderId} acknowledged as ${submitAck.ordId}, read-back timeout`,
+          ),
+        )
+      }
 
-        return this.handleOkxErrors(
-          this.getOrder,
-          { symbol, newClientOrderId },
-          timeProfile,
-        )(new OKXError('Cannot find order', 0))
-      })
-      .catch(
-        this.handleOkxErrors(
-          this.openOrder,
-          order,
-          this.endProfilerTime(timeProfile, 'exchange'),
-        ),
+      return this.handleOkxErrors(
+        this.getOrder,
+        { symbol, newClientOrderId },
+        timeProfile,
+      )(new OKXError('Cannot find order', 0))
+    } catch (e) {
+      // The order is on OKX; only reading it back failed. `getOrder` maps the
+      // pair itself, so it gets the Gainium pair, not the instId.
+      return this.handleOkxErrors(
+        this.getOrder,
+        { symbol: _symbol, newClientOrderId },
+        this.endProfilerTime(timeProfile, 'exchange'),
+      )(e as any)
+    }
+  }
+
+  /**
+   * The retry target for a failed submit. The failure may have been a lost
+   * response to an order OKX did accept, so ask first and only re-submit when
+   * OKX does not have it.
+   */
+  private async resubmitOrder(
+    order: Parameters<OKXExchange['openOrder']>[0],
+    timeProfile: TimeProfile,
+  ): Promise<BaseReturn<CommonOrder>> {
+    if (order.newClientOrderId) {
+      const existing = await this.findOrderByClientId(
+        this.updateSymbol(order.symbol),
+        order.newClientOrderId,
+        timeProfile,
       )
+      if (existing) {
+        Logger.warn(
+          `OKX ${order.newClientOrderId} reached ${order.symbol} despite the failed submit, not re-submitting`,
+        )
+        return existing
+      }
+    }
+    return this.openOrder(order, timeProfile)
+  }
+
+  /**
+   * One read of an order by clOrdId. `undefined` when OKX does not have it OR
+   * the read itself failed; the callers then fall back to what they would have
+   * done without asking, so this never throws.
+   */
+  private async findOrderByClientId(
+    instId: string,
+    clOrdId: string,
+    timeProfile: TimeProfile,
+  ): Promise<BaseReturn<CommonOrder> | undefined> {
+    try {
+      timeProfile =
+        (await this.checkLimits('getOrderDetails', 3000, 25, timeProfile)) ||
+        timeProfile
+      const found = await this.client.getOrderDetails({ instId, clOrdId })
+      if (found.length) {
+        return this.returnGood<CommonOrder>(timeProfile)(
+          await this.convertOrder(found[0]),
+        )
+      }
+    } catch {
+      // unknown — the caller decides without the answer
+    }
+    return undefined
   }
 
   private convertInterval(interval: ExchangeIntervals): string {
@@ -2106,8 +2362,17 @@ class OKXExchange extends AbstractExchange implements Exchange {
     if (timeProfile) {
       timeProfile = this.startProfilerTime(timeProfile, 'queue')
     }
+    // Private endpoints are limited per account at OKX: count them in this
+    // account's own bucket, never in one shared by every account here.
+    const accountLimit = this.key ? limitHelper.okxPrivateLimit(id) : null
+    const bucket = accountLimit ? `${this.limitAccountRef()}|${id}` : id
     const limitInstance = new limitHelper.Limit()
-    const limit = await limitInstance.addMethod(id, frame, frameCount)
+    const limit = await limitInstance.addMethod(
+      bucket,
+      accountLimit?.frame ?? frame,
+      accountLimit?.frameCount ?? frameCount,
+      !!accountLimit,
+    )
     if (limit > 0) {
       await sleep(limit)
       await this.checkLimits(id, frame, frameCount)

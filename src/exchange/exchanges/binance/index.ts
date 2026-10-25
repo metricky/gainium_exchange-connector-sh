@@ -22,6 +22,8 @@ import {
 } from 'binance'
 import { USDMClient, CoinMClient, MainClient } from '../../../binance-custom'
 import limitHelper from './limit'
+import { pooledMarginFromBinance } from './pooledMargin'
+import { futuresAssetBalance } from './futuresBalance'
 import { normalizeOrderFees } from '../../helpers/orderFee'
 import {
   BaseReturn,
@@ -63,6 +65,7 @@ import { sleep } from '../../../utils/sleepUtils'
 import { safeStringify } from '../../../utils/redact'
 import { keyFingerprint } from '../../../utils/keyFingerprint'
 import { pageCandleRange } from '../../helpers/candlePager'
+import { binanceDeliveryTime } from '../../helpers/deliveryTime'
 import { timeIntervalMap } from '../okx'
 
 /**
@@ -76,6 +79,35 @@ import { timeIntervalMap } from '../okx'
  */
 const SPOT_CANDLE_PAGE_SIZE = 1000
 const FUTURES_CANDLE_PAGE_SIZE = 1500
+
+/**
+ * The venue's own trade id for one fill of a spot FULL placement response.
+ *
+ * Binance sends `tradeId` on every such fill (a JSON integer — the same id
+ * the public trade tape and `myTrades` carry), even though the vendor SDK's
+ * `OrderFill` type leaves it out. Using it lets a fill be matched to the
+ * venue's trade exactly instead of by price/qty/time.
+ *
+ * Only a positive integer counts as a venue id. Anything else falls back to
+ * `${orderId}-${index}`, which can never be mistaken for one: an absent field,
+ * and the `-1` Binance reports for SOR allocations, which are not trades on
+ * the tape. Emitted as a string, as `CommonOrder.fills[].tradeId` is typed.
+ */
+const fillTradeId = (
+  fill: object,
+  orderId: number | string,
+  index: number,
+): string => {
+  // Not on the SDK's `OrderFill` type, so read it untyped.
+  const id = (fill as { tradeId?: unknown } | undefined)?.tradeId
+  if (typeof id === 'number' && Number.isSafeInteger(id) && id > 0) {
+    return `${id}`
+  }
+  if (typeof id === 'string' && /^[1-9]\d*$/.test(id)) {
+    return id
+  }
+  return `${orderId}-${index}`
+}
 
 export enum HttpMethod {
   GET = 'GET',
@@ -737,21 +769,49 @@ class BinanceExchange extends AbstractExchange implements Exchange {
         ) => {
           timeProfile = this.endProfilerTime(timeProfile, 'exchange')
           return this.returnGood<FreeAsset>(timeProfile)(
-            accountInfo.assets.map((balance: FuturesAccountAsset) => ({
-              asset: balance.asset,
-              free: parseFloat(`${balance.maxWithdrawAmount}`),
-              locked:
-                parseFloat(`${balance.walletBalance}`) > 0
-                  ? parseFloat(`${balance.walletBalance}`) -
-                    parseFloat(`${balance.maxWithdrawAmount}`)
-                  : 0,
-            })),
+            accountInfo.assets.map((balance: FuturesAccountAsset) =>
+              futuresAssetBalance(balance),
+            ),
           )
         },
       )
       .catch(
         this.handleBinanceErrors(
           this.futures_getBalance,
+          this.endProfilerTime(timeProfile, 'exchange'),
+        ),
+      )
+  }
+
+  /**
+   * Pooled collateral in USD for a USDⓈ-M account in Multi-Assets mode (see
+   * {@link pooledMarginFromBinance}); `null` for spot, COIN-M and single-asset
+   * USDⓈ-M accounts.
+   *
+   * One read. Callers ask only after their own per-coin check has come up
+   * short.
+   */
+  async getMarginAvailableUsd(
+    timeProfile = this.getEmptyTimeProfile(),
+  ): Promise<BaseReturn<number | null>> {
+    if (!this.usdm || !this.usdmClient) {
+      return this.returnGood<number | null>(timeProfile)(null)
+    }
+    timeProfile =
+      (await this.checkLimits('getBalance', 'request', 5, timeProfile)) ||
+      timeProfile
+    timeProfile = this.startProfilerTime(timeProfile, 'exchange')
+    return this.usdmClient
+      .getAccountInformation()
+      .then((accountInfo: FuturesAccountInformation) => {
+        timeProfile = this.endProfilerTime(timeProfile, 'exchange')
+        return this.returnGood<number | null>(timeProfile)(
+          pooledMarginFromBinance(accountInfo),
+        )
+      })
+      .catch(
+        this.handleBinanceErrors(
+          this.getMarginAvailableUsd,
           this.endProfilerTime(timeProfile, 'exchange'),
         ),
       )
@@ -1820,6 +1880,11 @@ class BinanceExchange extends AbstractExchange implements Exchange {
                   : undefined,
                 priceAssetPrecision: this.getPricePrecision(
                   `${priceFilter?.tickSize || '0.1'}`,
+                ),
+                // Quarterly contracts; perpetuals carry a placeholder date.
+                deliveryTime: binanceDeliveryTime(
+                  pair.contractType,
+                  pair.deliveryDate,
                 ),
                 priceMultiplier: multiplierFilter
                   ? {
@@ -3357,10 +3422,7 @@ class BinanceExchange extends AbstractExchange implements Exchange {
         qty: `${f.qty}`,
         commission: `${f.commission}`,
         commissionAsset: f.commissionAsset,
-        // Binance's spot FULL response omits `tradeId` on the fill; the index
-        // keeps the entries distinguishable without inventing an id that
-        // looks like the venue's.
-        tradeId: `${order.orderId}-${i}`,
+        tradeId: fillTradeId(f, order.orderId, i),
       })),
     }
   }
